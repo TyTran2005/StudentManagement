@@ -14,7 +14,7 @@ import (
 var DB *gorm.DB
 
 func ConnectDatabase(cfg *config.Config) (*gorm.DB, error) {
-	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=%s TimeZone=Asia/Shanghai", 
+	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=%s TimeZone=Asia/Shanghai",
 		cfg.DBHost,
 		cfg.DBUser,
 		cfg.DBPassword,

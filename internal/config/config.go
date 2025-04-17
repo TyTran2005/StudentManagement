@@ -22,9 +22,9 @@ type Config struct {
 var AppConfig *Config
 
 func LoadConfig() (*Config, error) {
-	viper.AddConfigPath(".")    
-	viper.SetConfigName(".env") 
-	viper.SetConfigType("env")  
+	viper.AddConfigPath(".")
+	viper.SetConfigName(".env")
+	viper.SetConfigType("env")
 
 	viper.AutomaticEnv()
 

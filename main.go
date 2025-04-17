@@ -4,48 +4,49 @@ import (
 	"log"
 	"net/http"
 	"student-management-api/internal/config"
+	"student-management-api/internal/database"
 	"student-management-api/internal/graphql"
-	"student-management-api/internal/models"
+	"student-management-api/internal/middleware"
 	"student-management-api/internal/resolvers"
 
-	"github.com/graphql-go/handler"
-	"gorm.io/driver/postgres"
-	"gorm.io/gorm"
+	gqlhandler "github.com/graphql-go/handler"
 )
 
 func main() {
 	cfg, err := config.LoadConfig()
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		log.Fatalf("FATAL: Failed to load config: %v", err)
 	}
 
-	dsn := "host=" + cfg.DBHost +
-		" port=" + cfg.DBPort +
-		" user=" + cfg.DBUser +
-		" password=" + cfg.DBPassword +
-		" dbname=" + cfg.DBName +
-		" sslmode=" + cfg.DBSslmode
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	db, err := database.ConnectDatabase(cfg)
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		log.Fatalf("FATAL: Failed to connect to database or run migrations: %v", err)
 	}
-	log.Println("Connected to the database successfully!")
 
 	resolvers.DB = db
+	log.Println("INFO: Database connection assigned to resolvers.")
 
-	err = db.AutoMigrate(&models.User{}, &models.Class{}, &models.StudentClass{})
-	if err != nil {
-		log.Fatalf("Failed to migrate database: %v", err)
-	}
-
-	h := handler.New(&handler.Config{
-		Schema:   &graphql.Schema,
-		Pretty:   true,
-		GraphiQL: true,
+	gqlHandler := gqlhandler.New(&gqlhandler.Config{
+		Schema:     &graphql.Schema,
+		Pretty:     true,
+		GraphiQL:   true,
+		Playground: false,
 	})
 
-	http.Handle("/graphql", h)
+	mux := http.NewServeMux()
 
-	log.Println("Server is running on port", cfg.ServerPort)
-	log.Fatal(http.ListenAndServe(":"+cfg.ServerPort, nil))
+	mux.Handle("/graphql", middleware.AuthMiddleware(gqlHandler))
+
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+
+	serverAddr := ":" + cfg.ServerPort
+	log.Printf("INFO: Starting GraphQL server on %s", serverAddr)
+	log.Printf("INFO: GraphiQL UI available at http://localhost%s/graphql", serverAddr)
+
+	if err := http.ListenAndServe(serverAddr, mux); err != nil {
+		log.Fatalf("FATAL: Server failed to start: %v", err)
+	}
 }

@@ -2,15 +2,13 @@ package graphql
 
 import (
 	"errors"
-	"student-management-api/internal/database"
+	"log"
 	"student-management-api/internal/models"
 	"student-management-api/internal/resolvers"
 	"time"
 
 	"github.com/graphql-go/graphql"
 )
-
-var DB = database.DB
 
 var UserType = graphql.NewObject(
 	graphql.ObjectConfig{
@@ -19,7 +17,7 @@ var UserType = graphql.NewObject(
 			"id":       &graphql.Field{Type: graphql.ID},
 			"fullname": &graphql.Field{Type: graphql.String},
 			"email":    &graphql.Field{Type: graphql.String},
-			"role":     &graphql.Field{Type: graphql.Boolean},
+			"role":     &graphql.Field{Type: graphql.Boolean, Description: "false: student, true: teacher"},
 		},
 	},
 )
@@ -31,57 +29,91 @@ var ClassType = graphql.NewObject(
 			"id":      &graphql.Field{Type: graphql.ID},
 			"name":    &graphql.Field{Type: graphql.String},
 			"subject": &graphql.Field{Type: graphql.String},
-			"status":  &graphql.Field{Type: graphql.Boolean},
+			"status":  &graphql.Field{Type: graphql.Boolean, Description: "true: open, false: closed"},
 			"teacher": &graphql.Field{
 				Type: UserType,
 				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-					class, _ := p.Source.(models.Class)
-					return class.Teacher, nil
+					switch class := p.Source.(type) {
+					case models.Class:
+						return class.Teacher, nil
+					case *models.Class:
+						if class != nil {
+							return class.Teacher, nil
+						}
+					}
+					return nil, nil
 				},
 			},
 			"leader": &graphql.Field{
 				Type: UserType,
 				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-					class, _ := p.Source.(models.Class)
-					return class.Leader, nil
+					switch class := p.Source.(type) {
+					case models.Class:
+						return class.Leader, nil
+					case *models.Class:
+						if class != nil {
+							return class.Leader, nil
+						}
+					}
+					return nil, nil
 				},
 			},
 			"studentCount": &graphql.Field{
 				Type: graphql.Int,
 				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-					class, ok := p.Source.(models.Class)
-					if !ok {
-						if classPtr, okPtr := p.Source.(*models.Class); okPtr && classPtr != nil {
-							class = *classPtr
-						} else {
-							return nil, errors.New("internal error: could not determine class source")
+					var classID uint
+					switch class := p.Source.(type) {
+					case models.Class:
+						classID = class.ID
+						if class.StudentClasses != nil {
+							return len(class.StudentClasses), nil
 						}
+					case *models.Class:
+						if class != nil {
+							classID = class.ID
+							if class.StudentClasses != nil {
+								return len(class.StudentClasses), nil
+							}
+						} else {
+							return 0, nil
+						}
+					default:
+						log.Printf("ERROR: Unexpected source type in studentCount resolver: %T", p.Source)
+						return nil, errors.New("internal error: could not determine class source")
 					}
-					if class.StudentClasses != nil {
-						return len(class.StudentClasses), nil
-					}
-					var count int64
-
 					if resolvers.DB == nil {
+						log.Println("ERROR: Database connection is not available in studentCount resolver")
 						return nil, errors.New("database connection is not available")
 					}
 
-					if err := resolvers.DB.Model(&models.StudentClass{}).Where("class_id = ?", class.ID).Count(&count).Error; err != nil {
+					var count int64
+					if err := resolvers.DB.Model(&models.StudentClass{}).
+						Where("class_id = ? AND left_at IS NULL", classID).
+						Count(&count).Error; err != nil {
+						log.Printf("ERROR: Failed to count students for class %d: %v", classID, err)
 						return nil, errors.New("failed to count students")
 					}
 					return int(count), nil
 				},
-				Description: "Total number of students enrolled in the class.",
+				Description: "Total number of currently enrolled students in the class.",
 			},
 			"studentClasses": &graphql.Field{
 				Type: graphql.NewList(StudentClassType),
 				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-					class, _ := p.Source.(models.Class)
-					if class.StudentClasses == nil {
-						return []models.StudentClass{}, nil
+
+					switch class := p.Source.(type) {
+					case models.Class:
+						if class.StudentClasses != nil {
+							return class.StudentClasses, nil
+						}
+					case *models.Class:
+						if class != nil && class.StudentClasses != nil {
+							return class.StudentClasses, nil
+						}
 					}
-					return class.StudentClasses, nil
+					return []models.StudentClass{}, nil
 				},
+				Description: "List of student enrollment records (visible to teachers).",
 			},
 		},
 	},
@@ -94,96 +126,66 @@ var StudentClassType = graphql.NewObject(
 			"student": &graphql.Field{
 				Type: UserType,
 				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-					studentClass, _ := p.Source.(models.StudentClass)
-					return studentClass.Student, nil
+					switch sc := p.Source.(type) {
+					case models.StudentClass:
+						return sc.Student, nil
+					case *models.StudentClass:
+						if sc != nil {
+							return sc.Student, nil
+						}
+					}
+					return nil, nil
 				},
 			},
 			"enrolledAt": &graphql.Field{
 				Type: graphql.String,
 				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
-					studentClass, _ := p.Source.(models.StudentClass)
-					return studentClass.EnrolledAt.Format(time.RFC3339), nil
+					var enrolledAt time.Time
+					switch sc := p.Source.(type) {
+					case models.StudentClass:
+						enrolledAt = sc.EnrolledAt
+					case *models.StudentClass:
+						if sc != nil {
+							enrolledAt = sc.EnrolledAt
+						} else {
+							return nil, nil
+						}
+					default:
+						return nil, errors.New("internal error: unexpected source type for enrolledAt")
+					}
+					if !enrolledAt.IsZero() {
+						return enrolledAt.Format(time.RFC3339), nil
+					}
+					return nil, nil
 				},
 			},
-		},
-	},
-)
-
-var RootQuery = graphql.NewObject(
-	graphql.ObjectConfig{
-		Name: "RootQuery",
-		Fields: graphql.Fields{
-			"users": &graphql.Field{
-				Type: graphql.NewList(UserType),
-				Resolve: func(params graphql.ResolveParams) (interface{}, error) {
-					return resolvers.GetUsers()
+			"classID": &graphql.Field{
+				Type: graphql.Int,
+				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+					switch sc := p.Source.(type) {
+					case models.StudentClass:
+						return int(sc.ClassID), nil
+					case *models.StudentClass:
+						if sc != nil {
+							return int(sc.ClassID), nil
+						}
+					}
+					return nil, nil
 				},
 			},
-			"classes": &graphql.Field{
-				Type: graphql.NewList(ClassType),
-				Args: graphql.FieldConfigArgument{
-					"name": &graphql.ArgumentConfig{
-						Type: graphql.String,
-					},
-					"status": &graphql.ArgumentConfig{
-						Type:        graphql.Boolean,
-						Description: "Lọc lớp theo trạng thái (true: đang mở, false: đã đóng)",
-					},
-					"leaderID": &graphql.ArgumentConfig{
-						Type:        graphql.Int,
-						Description: "ID của người lãnh đạo lớp (nếu có)",
-					},
-					"leaderName": &graphql.ArgumentConfig{
-						Type:        graphql.String,
-						Description: "Lọc theo tên lớp trưởng",
-					},
+			"studentID": &graphql.Field{
+				Type: graphql.Int,
+				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+					switch sc := p.Source.(type) {
+					case models.StudentClass:
+						return int(sc.StudentID), nil
+					case *models.StudentClass:
+						if sc != nil {
+							return int(sc.StudentID), nil
+						}
+					}
+					return nil, nil
 				},
-				Resolve: resolvers.GetClasses,
-			},
-			"openClasses": &graphql.Field{
-				Type:        graphql.NewList(ClassType),
-				Resolve:     resolvers.GetOpenClasses,
-				Description: "Get a list of classes currently open for enrollment (status=true).",
-			},
-			"registeredClasses": &graphql.Field{
-				Type: graphql.NewList(ClassType),
-				Args: graphql.FieldConfigArgument{
-					"studentID": &graphql.ArgumentConfig{
-						Type: graphql.Int,
-					},
-					"name": &graphql.ArgumentConfig{
-						Type: graphql.String,
-					},
-					"teacherName": &graphql.ArgumentConfig{
-						Type: graphql.String,
-					},
-				},
-				Resolve: resolvers.GetRegisteredClasses,
-			},
-			"studentClassDetail": &graphql.Field{
-				Type: ClassType,
-				Args: graphql.FieldConfigArgument{
-					"classID": &graphql.ArgumentConfig{
-						Type: graphql.Int,
-					},
-					"studentID": &graphql.ArgumentConfig{
-						Type: graphql.Int,
-					},
-				},
-				Resolve: resolvers.GetStudentClassDetail,
-			},
-			"classDetail": &graphql.Field{
-				Type: ClassType,
-				Args: graphql.FieldConfigArgument{
-					"classID": &graphql.ArgumentConfig{
-						Type: graphql.NewNonNull(graphql.Int),
-					},
-					"userID": &graphql.ArgumentConfig{
-						Type:        graphql.NewNonNull(graphql.Int),
-						Description: "ID of the user requesting details (must be a teacher for full details)",
-					},
-				},
-				Resolve: resolvers.GetClassDetail,
 			},
 		},
 	},
@@ -199,133 +201,141 @@ var LoginResponseType = graphql.NewObject(
 	},
 )
 
-var RootMutation = graphql.NewObject(
+var RootQuery = graphql.NewObject(
 	graphql.ObjectConfig{
-		Name: "RootMutation",
+		Name: "RootQuery",
 		Fields: graphql.Fields{
+			"users": &graphql.Field{
+				Type:        graphql.NewList(UserType),
+				Resolve:     resolvers.GetUsers,
+				Description: "Get a list of all users (requires appropriate permissions).",
+			},
 			"classes": &graphql.Field{
 				Type: graphql.NewList(ClassType),
 				Args: graphql.FieldConfigArgument{
 					"name": &graphql.ArgumentConfig{
-						Type: graphql.String,
+						Type:        graphql.String,
+						Description: "Filter classes by name (case-insensitive, partial match).",
 					},
+					"status": &graphql.ArgumentConfig{
+						Type:        graphql.Boolean,
+						Description: "Filter classes by status (true: open, false: closed).",
+					},
+
 					"leaderName": &graphql.ArgumentConfig{
-						Type: graphql.String,
+						Type:        graphql.String,
+						Description: "Filter classes by leader's name (case-insensitive, partial match).",
 					},
 				},
-				Resolve: resolvers.GetClasses,
+				Resolve:     resolvers.GetClasses,
+				Description: "Get a list of classes with filters (teacher access recommended).",
 			},
-			"register": &graphql.Field{
-				Type: UserType,
-				Args: graphql.FieldConfigArgument{
-					"fullname": &graphql.ArgumentConfig{Type: graphql.String},
-					"email":    &graphql.ArgumentConfig{Type: graphql.String},
-					"password": &graphql.ArgumentConfig{Type: graphql.String},
-					"role":     &graphql.ArgumentConfig{Type: graphql.Boolean},
-				},
-				Resolve: resolvers.RegisterUser,
-			},
-			"createClass": &graphql.Field{
-				Type: ClassType,
-				Args: graphql.FieldConfigArgument{
-					"name":      &graphql.ArgumentConfig{Type: graphql.String},
-					"subject":   &graphql.ArgumentConfig{Type: graphql.String},
-					"teacherID": &graphql.ArgumentConfig{Type: graphql.Int},
-					"status":    &graphql.ArgumentConfig{Type: graphql.Boolean},
-					"leaderID":  &graphql.ArgumentConfig{Type: graphql.Int},
-				},
-				Resolve: resolvers.CreateClass,
-			},
-			"login": &graphql.Field{
-				Type: LoginResponseType,
-				Args: graphql.FieldConfigArgument{
-					"email":    &graphql.ArgumentConfig{Type: graphql.String},
-					"password": &graphql.ArgumentConfig{Type: graphql.String},
-				},
-				Resolve: resolvers.LoginUser,
-			},
-			"updateUser": &graphql.Field{
-				Type: UserType,
-				Args: graphql.FieldConfigArgument{
-					"id":       &graphql.ArgumentConfig{Type: graphql.Int},
-					"fullname": &graphql.ArgumentConfig{Type: graphql.String},
-					"password": &graphql.ArgumentConfig{Type: graphql.String},
-				},
-				Resolve: resolvers.UpdateUser,
-			},
-			"joinClass": &graphql.Field{
-				Type: StudentClassType,
-				Args: graphql.FieldConfigArgument{
-					"classID":   &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.Int)},
-					"studentID": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.Int)},
-				},
-				Resolve:     resolvers.JoinClass,
-				Description: "Join an open class. Requires student authentication. Returns the enrollment record.",
-			},
-			"deleteClass": &graphql.Field{
-				Type: graphql.String,
-				Args: graphql.FieldConfigArgument{
-					"classID": &graphql.ArgumentConfig{Type: graphql.Int},
-					"userID":  &graphql.ArgumentConfig{Type: graphql.Int},
-				},
-				Resolve: resolvers.DeleteClass,
-			},
-			"leaveClass": &graphql.Field{
-				Type: graphql.String,
-				Args: graphql.FieldConfigArgument{
-					"classID":   &graphql.ArgumentConfig{Type: graphql.Int},
-					"studentID": &graphql.ArgumentConfig{Type: graphql.Int},
-				},
-				Resolve: resolvers.LeaveClass,
+
+			"openClasses": &graphql.Field{
+				Type:        graphql.NewList(ClassType),
+				Resolve:     resolvers.GetOpenClasses,
+				Description: "Get a list of classes currently open for enrollment (status=true).",
 			},
 			"registeredClasses": &graphql.Field{
 				Type: graphql.NewList(ClassType),
 				Args: graphql.FieldConfigArgument{
-					"studentID": &graphql.ArgumentConfig{
-						Type: graphql.Int,
-					},
 					"name": &graphql.ArgumentConfig{
-						Type: graphql.String,
+						Type:        graphql.String,
+						Description: "Filter registered classes by name (case-insensitive, partial match).",
 					},
 					"teacherName": &graphql.ArgumentConfig{
-						Type: graphql.String,
+						Type:        graphql.String,
+						Description: "Filter registered classes by teacher's name (case-insensitive, partial match).",
 					},
 				},
-				Resolve: resolvers.GetRegisteredClasses,
+				Resolve:     resolvers.GetRegisteredClasses,
+				Description: "Get the list of classes the logged-in student is registered for.",
 			},
 			"studentClassDetail": &graphql.Field{
 				Type: ClassType,
 				Args: graphql.FieldConfigArgument{
 					"classID": &graphql.ArgumentConfig{
-						Type: graphql.Int,
-					},
-					"studentID": &graphql.ArgumentConfig{
-						Type: graphql.Int,
+						Type: graphql.NewNonNull(graphql.Int),
 					},
 				},
-				Resolve: resolvers.GetStudentClassDetail,
+				Resolve:     resolvers.GetStudentClassDetail,
+				Description: "Get details of a specific class the logged-in student is registered for.",
 			},
+
 			"classDetail": &graphql.Field{
 				Type: ClassType,
 				Args: graphql.FieldConfigArgument{
 					"classID": &graphql.ArgumentConfig{
-						Type: graphql.Int,
-					},
-					"userID": &graphql.ArgumentConfig{
-						Type: graphql.Int,
+						Type: graphql.NewNonNull(graphql.Int),
 					},
 				},
-				Resolve: resolvers.GetClassDetail,
+				Resolve:     resolvers.GetClassDetail,
+				Description: "Get detailed information about a class, including student list (teacher access required).",
+			},
+
+			"me": &graphql.Field{
+				Type:        UserType,
+				Resolve:     resolvers.GetCurrentUser,
+				Description: "Get information about the currently logged-in user.",
+			},
+		},
+	},
+)
+
+var RootMutation = graphql.NewObject(
+	graphql.ObjectConfig{
+		Name: "RootMutation",
+		Fields: graphql.Fields{
+
+			"register": &graphql.Field{
+				Type: UserType,
+				Args: graphql.FieldConfigArgument{
+					"fullname": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.String)},
+					"email":    &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.String)},
+					"password": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.String)},
+					"role":     &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.Boolean), Description: "false: student, true: teacher"},
+				},
+				Resolve: resolvers.RegisterUser,
+			},
+
+			"login": &graphql.Field{
+				Type: LoginResponseType,
+				Args: graphql.FieldConfigArgument{
+					"email":    &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.String)},
+					"password": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.String)},
+				},
+				Resolve: resolvers.LoginUser,
+			},
+
+			"updateUser": &graphql.Field{
+				Type: UserType,
+				Args: graphql.FieldConfigArgument{
+					"fullname": &graphql.ArgumentConfig{Type: graphql.String},
+					"password": &graphql.ArgumentConfig{Type: graphql.String},
+				},
+				Resolve:     resolvers.UpdateUser,
+				Description: "Update the logged-in user's fullname or password.",
+			},
+
+			"createClass": &graphql.Field{
+				Type: ClassType,
+				Args: graphql.FieldConfigArgument{
+					"name":    &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.String)},
+					"subject": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.String)},
+					"status":  &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.Boolean), Description: "Initial status (true: open, false: closed)"},
+					"leaderID": &graphql.ArgumentConfig{
+						Type:        graphql.Int,
+						Description: "Optional ID of the student user to be the class leader.",
+					},
+				},
+				Resolve:     resolvers.CreateClass,
+				Description: "Create a new class (teacher access required).",
 			},
 			"updateClass": &graphql.Field{
 				Type: ClassType,
 				Args: graphql.FieldConfigArgument{
 					"classID": &graphql.ArgumentConfig{
 						Type: graphql.NewNonNull(graphql.Int),
-					},
-					"userID": &graphql.ArgumentConfig{
-						Type:        graphql.NewNonNull(graphql.Int),
-						Description: "ID of the teacher making the update.",
 					},
 					"name": &graphql.ArgumentConfig{
 						Type:        graphql.String,
@@ -341,19 +351,59 @@ var RootMutation = graphql.NewObject(
 					},
 					"leaderID": &graphql.ArgumentConfig{
 						Type:        graphql.Int,
-						Description: "New leader ID for the class. User must exist and not be a teacher.",
+						Description: "New leader ID for the class. User must exist and be a student.",
 					},
 				},
 				Resolve:     resolvers.UpdateClass,
-				Description: "Allows a teacher to update the basic details of a class they own.",
+				Description: "Update details of a class owned by the logged-in teacher.",
+			},
+
+			"deleteClass": &graphql.Field{
+				Type: graphql.String,
+				Args: graphql.FieldConfigArgument{
+					"classID": &graphql.ArgumentConfig{
+						Type: graphql.NewNonNull(graphql.Int),
+					},
+				},
+				Resolve:     resolvers.DeleteClass,
+				Description: "Delete a class owned by the logged-in teacher (fails if >= 5 students).",
+			},
+			"joinClass": &graphql.Field{
+				Type: StudentClassType,
+				Args: graphql.FieldConfigArgument{
+					"classID": &graphql.ArgumentConfig{
+						Type: graphql.NewNonNull(graphql.Int),
+					},
+				},
+				Resolve:     resolvers.JoinClass,
+				Description: "Allows the logged-in student to join an open class.",
+			},
+			"leaveClass": &graphql.Field{
+				Type: graphql.String,
+				Args: graphql.FieldConfigArgument{
+					"classID": &graphql.ArgumentConfig{
+						Type: graphql.NewNonNull(graphql.Int),
+					},
+				},
+				Resolve:     resolvers.LeaveClass,
+				Description: "Allows the logged-in student to leave a class they are enrolled in.",
 			},
 		},
 	},
 )
 
-var Schema, _ = graphql.NewSchema(
-	graphql.SchemaConfig{
-		Query:    RootQuery,
-		Mutation: RootMutation,
-	},
-)
+var Schema graphql.Schema
+
+func init() {
+	var err error
+	Schema, err = graphql.NewSchema(
+		graphql.SchemaConfig{
+			Query:    RootQuery,
+			Mutation: RootMutation,
+		},
+	)
+	if err != nil {
+		log.Fatalf("FATAL: Failed to create GraphQL schema: %v", err)
+	}
+	log.Println("INFO: GraphQL schema created successfully.")
+}
