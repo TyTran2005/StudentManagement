@@ -681,7 +681,6 @@ func LeaveClass(params graphql.ResolveParams) (interface{}, error) {
 	}
 	classID := uint(classIDInput)
 
-	// Tìm bản ghi enrollment của sinh viên trong lớp đó và chưa rời
 	var enrollment models.StudentClass
 	err = DB.Where("student_id = ? AND class_id = ? AND left_at IS NULL", studentID, classID).First(&enrollment).Error
 
