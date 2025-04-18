@@ -1,10 +1,10 @@
+// internal/database/database.go
 package database
 
 import (
 	"fmt"
 	"log"
 	"student-management-api/internal/config"
-	"student-management-api/internal/models"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -23,29 +23,17 @@ func ConnectDatabase(cfg *config.Config) (*gorm.DB, error) {
 		cfg.DBSslmode,
 	)
 
-	var err error
-	DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Info),
 	})
 
 	if err != nil {
-		log.Printf("Failed to connect to database: %v", err)
+		log.Printf("ERROR: Failed to connect to database: %v", err)
 		return nil, fmt.Errorf("failed to connect database: %w", err)
 	}
 
-	log.Println("Database connection established successfully.")
+	log.Println("INFO: Database connection established successfully.")
 
-	log.Println("Running database migrations...")
-	err = DB.AutoMigrate(
-		&models.User{},
-		&models.Class{},
-		&models.StudentClass{},
-	)
-	if err != nil {
-		log.Printf("Failed to auto migrate database: %v", err)
-		return nil, fmt.Errorf("failed to auto migrate database: %w", err)
-	}
-	log.Println("Database migrations completed.")
-
-	return DB, nil
+	DB = db
+	return db, nil
 }

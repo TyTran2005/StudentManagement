@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS student_classes;
+DROP TABLE IF EXISTS classes;
+DROP TABLE IF EXISTS users;
