@@ -22,47 +22,40 @@ import (
 func main() {
 	cfg, err := config.LoadConfig()
 	if err != nil {
-		log.Fatalf("FATAL: Failed to load config: %v", err)
+		log.Fatalf("FATAL: Load config: %v", err)
 	}
-
 	db, err := database.ConnectDatabase(cfg)
 	if err != nil {
-		log.Fatalf("FATAL: Failed to connect to database: %v", err)
+		log.Fatalf("FATAL: Connect DB: %v", err)
 	}
 	resolvers.DB = db
-	log.Println("INFO: Database connection assigned to resolvers.")
-
+	log.Println("INFO: Database connection assigned.")
 	log.Println("INFO: Applying database migrations...")
-
-	dbURL := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s",
-		cfg.DBUser, cfg.DBPassword, cfg.DBHost, cfg.DBPort, cfg.DBName, cfg.DBSslmode)
-
+	dbURL := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s", cfg.DBUser, cfg.DBPassword, cfg.DBHost, cfg.DBPort, cfg.DBName, cfg.DBSslmode)
 	migrationPath := "file://database/migrations"
-
 	m, err := migrate.New(migrationPath, dbURL)
 	if err != nil {
-		log.Fatalf("FATAL: Failed to initialize migrate instance: %v", err)
+		log.Fatalf("FATAL: Init migrate: %v", err)
 	}
-
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-		log.Fatalf("FATAL: Failed to apply migrations: %v", err)
+		log.Fatalf("FATAL: Apply migrations: %v", err)
 	} else if errors.Is(err, migrate.ErrNoChange) {
-		log.Println("INFO: No new migrations to apply.")
+		log.Println("INFO: No new migrations.")
 	} else {
-		log.Println("INFO: Database migrations applied successfully.")
+		log.Println("INFO: Migrations applied.")
 	}
-
 	version, dirty, err := m.Version()
 	if err != nil && !errors.Is(err, migrate.ErrNilVersion) {
-		log.Printf("WARNING: Could not get migration version: %v", err)
+		log.Printf("WARN: Get migration version: %v", err)
 	} else if errors.Is(err, migrate.ErrNilVersion) {
-		log.Println("INFO: No migrations applied yet (version nil).")
+		log.Println("INFO: No migrations applied yet.")
 	} else {
-		log.Printf("INFO: Current migration version: %d, Dirty: %v", version, dirty)
+		log.Printf("INFO: Migration version: %d, Dirty: %v", version, dirty)
 		if dirty {
-			log.Println("WARNING: Migration is dirty. Check the schema_migrations table.")
+			log.Println("WARNING: Migration dirty.")
 		}
 	}
+
 	gqlHandler := gqlhandler.New(&gqlhandler.Config{
 		Schema:     &graphql.Schema,
 		Pretty:     true,
@@ -71,15 +64,17 @@ func main() {
 	})
 
 	mux := http.NewServeMux()
+
 	mux.Handle("/graphql", middleware.AuthMiddleware(gqlHandler))
+
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		sqlDB, err := db.DB()
 		if err != nil {
-			http.Error(w, "Failed to get underlying DB connection", http.StatusInternalServerError)
+			http.Error(w, "Failed DB conn", http.StatusInternalServerError)
 			return
 		}
 		if err := sqlDB.Ping(); err != nil {
-			http.Error(w, "Database connection failed", http.StatusInternalServerError)
+			http.Error(w, "DB ping failed", http.StatusInternalServerError)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -87,8 +82,10 @@ func main() {
 	})
 
 	serverAddr := ":" + cfg.ServerPort
-	log.Printf("INFO: Starting GraphQL server on %s", serverAddr)
+	log.Printf("INFO: Starting server on %s", serverAddr)
+	log.Printf("INFO: GraphQL endpoint: http://localhost%s/graphql", serverAddr)
 	log.Printf("INFO: GraphiQL UI available at http://localhost%s/graphql", serverAddr)
+	log.Printf("INFO: Health check endpoint: GET /health")
 
 	if err := http.ListenAndServe(serverAddr, mux); err != nil {
 		log.Fatalf("FATAL: Server failed to start: %v", err)

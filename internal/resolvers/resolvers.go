@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"student-management-api/internal/config"
 	"student-management-api/internal/middleware"
 	"student-management-api/internal/models"
@@ -17,67 +18,75 @@ import (
 
 var DB *gorm.DB
 
-func requireTeacher(params graphql.ResolveParams) (uint, error) {
-	userID, ok := middleware.GetUserIDFromContext(params.Context)
+func requireRole(params graphql.ResolveParams, requiredRole string) (string, error) {
+	userIDStr, ok := middleware.GetUserIDFromContext(params.Context)
 	if !ok {
-		return 0, errors.New("authorization required: please log in")
+		return "", errors.New("authorization required: user ID not found in context")
 	}
-	role, ok := middleware.GetRoleFromContext(params.Context)
+	actualRole, ok := middleware.GetRoleFromContext(params.Context)
 	if !ok {
-		log.Printf("ERROR: Role not found in context for userID %d", userID)
-		return 0, errors.New("internal authorization error: role missing")
+		log.Printf("ERROR: requireRole: Role not found in context for userID %s", userIDStr)
+		return "", errors.New("internal authorization error: role missing from context")
 	}
-	if !role {
-		return 0, errors.New("authorization error: teacher access required")
+	if actualRole != requiredRole {
+		return "", fmt.Errorf("authorization error: %s access required (current role: %s)", requiredRole, actualRole)
 	}
-	return userID, nil
+	return userIDStr, nil
 }
 
-func requireStudent(params graphql.ResolveParams) (uint, error) {
-	userID, ok := middleware.GetUserIDFromContext(params.Context)
-	if !ok {
-		return 0, errors.New("authorization required: please log in")
-	}
-	role, ok := middleware.GetRoleFromContext(params.Context)
-	if !ok {
-		log.Printf("ERROR: Role not found in context for userID %d", userID)
-		return 0, errors.New("internal authorization error: role missing")
-	}
-	if role {
-		return 0, errors.New("authorization error: student access required")
-	}
-	return userID, nil
+func requireTeacher(params graphql.ResolveParams) (string, error) {
+	return requireRole(params, "teacher")
 }
 
-func requireAuth(params graphql.ResolveParams) (uint, bool, error) {
-	userID, ok := middleware.GetUserIDFromContext(params.Context)
+func requireStudent(params graphql.ResolveParams) (string, error) {
+	return requireRole(params, "student")
+}
+
+func requireAuth(params graphql.ResolveParams) (string, string, error) {
+	userIDStr, ok := middleware.GetUserIDFromContext(params.Context)
 	if !ok {
-		return 0, false, errors.New("authorization required: please log in")
+		return "", "", errors.New("authorization required: user ID not found in context")
 	}
 	role, ok := middleware.GetRoleFromContext(params.Context)
 	if !ok {
-		log.Printf("ERROR: Role not found in context for userID %d", userID)
-		return 0, false, errors.New("internal authorization error: role missing")
+		log.Printf("ERROR: requireAuth: Role not found in context for userID %s", userIDStr)
+		return "", "", errors.New("internal authorization error: role missing from context")
 	}
-	return userID, role, nil
+	return userIDStr, role, nil
+}
+
+func getUserIDUint(userIDStr string) (uint, error) {
+	userIDUint64, err := strconv.ParseUint(userIDStr, 10, 64)
+	if err != nil {
+		log.Printf("ERROR: getUserIDUint: Could not parse user ID string '%s' to uint: %v", userIDStr, err)
+		return 0, errors.New("invalid user ID format encountered")
+	}
+	if userIDUint64 == 0 {
+		log.Printf("ERROR: getUserIDUint: Parsed user ID is 0 from string '%s'", userIDStr)
+		return 0, errors.New("invalid user ID (0) encountered")
+	}
+	return uint(userIDUint64), nil
 }
 
 func GetCurrentUser(params graphql.ResolveParams) (interface{}, error) {
-	userID, _, err := requireAuth(params)
+	userIDStr, _, err := requireAuth(params)
+	if err != nil {
+		return nil, err
+	}
+	userID, err := getUserIDUint(userIDStr)
 	if err != nil {
 		return nil, err
 	}
 
 	var user models.User
-	if err := DB.First(&user, userID).Error; err != nil {
+	if err := DB.Select("id", "fullname", "email", "role", "created_at", "updated_at").First(&user, userID).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			log.Printf("WARNING: User %d from token not found in DB", userID)
-			return nil, errors.New("user not found")
+			log.Printf("WARNING: GetCurrentUser: User %d (from token ID %s) not found in DB", userID, userIDStr)
+			return nil, errors.New("user associated with token not found")
 		}
-		log.Printf("ERROR: Failed to fetch user %d: %v", userID, err)
+		log.Printf("ERROR: GetCurrentUser: Failed fetch user %d: %v", userID, err)
 		return nil, errors.New("failed to retrieve user data")
 	}
-	user.Password = ""
 	return user, nil
 }
 
@@ -89,7 +98,7 @@ func GetUsers(params graphql.ResolveParams) (interface{}, error) {
 
 	var users []models.User
 	if err := DB.Select("id", "fullname", "email", "role", "created_at", "updated_at").Find(&users).Error; err != nil {
-		log.Printf("ERROR: Failed to get users: %v", err)
+		log.Printf("ERROR: GetUsers: Failed: %v", err)
 		return nil, errors.New("failed to retrieve users")
 	}
 	return users, nil
@@ -110,21 +119,18 @@ func GetClasses(params graphql.ResolveParams) (interface{}, error) {
 	if hasName && name != "" {
 		query = query.Where("LOWER(name) LIKE LOWER(?)", "%"+name+"%")
 	}
-
 	if hasStatus {
 		query = query.Where("status = ?", status)
 	}
-
 	if hasLeaderName && leaderName != "" {
-		query = query.Joins("LEFT JOIN users AS leader ON classes.leader_id = leader.id").
-			Where("LOWER(leader.fullname) LIKE LOWER(?)", "%"+leaderName+"%")
+		query = query.Joins("LEFT JOIN users AS leaders ON classes.leader_id = leaders.id").
+			Where("LOWER(leaders.fullname) LIKE LOWER(?)", "%"+leaderName+"%")
 	}
 
 	if err := query.Find(&classes).Error; err != nil {
 		log.Printf("ERROR: Failed to get classes: %v", err)
 		return nil, errors.New("failed to retrieve classes")
 	}
-
 	return classes, nil
 }
 
@@ -140,16 +146,18 @@ func GetOpenClasses(params graphql.ResolveParams) (interface{}, error) {
 		log.Printf("ERROR: Failed to retrieve open classes: %v", err)
 		return nil, errors.New("failed to retrieve open classes")
 	}
-
 	return classes, nil
 }
 
 func GetRegisteredClasses(params graphql.ResolveParams) (interface{}, error) {
-	studentID, err := requireStudent(params)
+	studentIDStr, err := requireStudent(params)
 	if err != nil {
 		return nil, err
 	}
-
+	studentID, err := getUserIDUint(studentIDStr)
+	if err != nil {
+		return nil, err
+	}
 	name, hasName := params.Args["name"].(string)
 	teacherName, hasTeacherName := params.Args["teacherName"].(string)
 
@@ -167,22 +175,24 @@ func GetRegisteredClasses(params graphql.ResolveParams) (interface{}, error) {
 	if hasName && name != "" {
 		query = query.Where("LOWER(classes.name) LIKE LOWER(?)", "%"+name+"%")
 	}
-
 	if hasTeacherName && teacherName != "" {
 		query = query.Joins("JOIN users AS teacher ON classes.teacher_id = teacher.id").
 			Where("LOWER(teacher.fullname) LIKE LOWER(?)", "%"+teacherName+"%")
 	}
 	var classes []models.Class
 	if err := query.Find(&classes).Error; err != nil {
-		log.Printf("ERROR: Failed to get registered classes for student %d: %v", studentID, err)
+		log.Printf("ERROR: GetRegisteredClasses: Failed for student %d: %v", studentID, err)
 		return nil, errors.New("failed to retrieve registered classes")
 	}
-
 	return classes, nil
 }
 
 func GetStudentClassDetail(params graphql.ResolveParams) (interface{}, error) {
-	studentID, err := requireStudent(params)
+	studentIDStr, err := requireStudent(params)
+	if err != nil {
+		return nil, err
+	}
+	studentID, err := getUserIDUint(studentIDStr)
 	if err != nil {
 		return nil, err
 	}
@@ -201,25 +211,34 @@ func GetStudentClassDetail(params graphql.ResolveParams) (interface{}, error) {
 		Preload("Class.Leader", func(db *gorm.DB) *gorm.DB {
 			return db.Select("id", "fullname", "email", "role")
 		}).
+		Preload("Class").
 		First(&studentClass).Error
 
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, errors.New("class not found or student not enrolled in this class")
 		}
-		log.Printf("ERROR: Failed to get student class detail for student %d, class %d: %v", studentID, classID, err)
+		log.Printf("ERROR: GetStudentClassDetail: Failed to fetch enrollment for student %d, class %d: %v", studentID, classID, err)
 		return nil, errors.New("failed to retrieve class details")
+	}
+
+	if studentClass.Class.ID == 0 {
+		log.Printf("ERROR: GetStudentClassDetail: Preloaded Class data has ID 0 for StudentClass (StudentID: %d, ClassID: %d)", studentID, classID)
+		return nil, errors.New("failed to retrieve valid class details (internal data inconsistency)")
 	}
 
 	return studentClass.Class, nil
 }
 
 func GetClassDetail(params graphql.ResolveParams) (interface{}, error) {
-	teacherID, err := requireTeacher(params)
+	teacherIDStr, err := requireTeacher(params)
 	if err != nil {
 		return nil, err
 	}
-
+	teacherID, err := getUserIDUint(teacherIDStr)
+	if err != nil {
+		return nil, err
+	}
 	classIDInput, ok := params.Args["classID"].(int)
 	if !ok || classIDInput <= 0 {
 		return nil, errors.New("invalid classID provided")
@@ -240,8 +259,12 @@ func GetClassDetail(params graphql.ResolveParams) (interface{}, error) {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, errors.New("class not found")
 		}
-		log.Printf("ERROR: Failed to get class detail for class %d by teacher %d: %v", classID, teacherID, err)
+		log.Printf("ERROR: GetClassDetail: Failed for class %d by teacher %d: %v", classID, teacherID, err)
 		return nil, errors.New("failed to retrieve class details")
+	}
+	if class.TeacherID == nil || *class.TeacherID != teacherID {
+		log.Printf("WARN: GetClassDetail: Teacher %d accessed details for class %d owned by TeacherID %v", teacherID, classID, class.TeacherID)
+		return nil, errors.New("authorization error: you are not the teacher of this class")
 	}
 	return class, nil
 }
@@ -250,24 +273,27 @@ func RegisterUser(params graphql.ResolveParams) (interface{}, error) {
 	fullname := params.Args["fullname"].(string)
 	email := params.Args["email"].(string)
 	password := params.Args["password"].(string)
-	role := params.Args["role"].(bool)
+	roleInput, roleProvided := params.Args["role"].(bool)
 
 	if fullname == "" || email == "" || password == "" {
 		return nil, errors.New("fullname, email, and password are required")
+	}
+	if !roleProvided {
+		roleInput = false
 	}
 
 	var existingUser models.User
 	err := DB.Where("email = ?", email).First(&existingUser).Error
 	if err == nil {
 		return nil, errors.New("email already exists")
-	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		log.Printf("ERROR: DB error checking existing email %s: %v", email, err)
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		log.Printf("ERROR: RegisterUser Logic: DB error check email %s: %v", email, err)
 		return nil, errors.New("database error checking email")
 	}
+
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		log.Printf("ERROR: Failed to hash password for email %s: %v", email, err)
+		log.Printf("ERROR: RegisterUser Logic: Failed hash password for %s: %v", email, err)
 		return nil, errors.New("failed to process password")
 	}
 
@@ -275,16 +301,20 @@ func RegisterUser(params graphql.ResolveParams) (interface{}, error) {
 		Fullname: fullname,
 		Email:    email,
 		Password: string(hashedPassword),
-		Role:     role,
+		Role:     roleInput,
 	}
 
 	if err := DB.Create(&user).Error; err != nil {
-		log.Printf("ERROR: Failed to create user %s: %v", email, err)
+		log.Printf("ERROR: RegisterUser Logic: Failed create user %s: %v", email, err)
 		return nil, errors.New("failed to register user")
 	}
 
-	user.Password = ""
-	return user, nil
+	log.Printf("INFO: RegisterUser Logic: User registered: %s (ID: %d)", user.Email, user.ID)
+	userResult := models.User{
+		ID: user.ID, Fullname: user.Fullname, Email: user.Email,
+		Role: user.Role, CreatedAt: user.CreatedAt, UpdatedAt: user.UpdatedAt,
+	}
+	return userResult, nil
 }
 
 func LoginUser(params graphql.ResolveParams) (interface{}, error) {
@@ -300,114 +330,143 @@ func LoginUser(params graphql.ResolveParams) (interface{}, error) {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, errors.New("invalid email or password")
 		}
-		log.Printf("ERROR: DB error finding user %s for login: %v", email, err)
+		log.Printf("ERROR: LoginUser Logic: DB error find user %s: %v", email, err)
 		return nil, errors.New("database error during login")
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(password)); err != nil {
 		return nil, errors.New("invalid email or password")
 	}
-	if config.AppConfig == nil || config.AppConfig.JWTSecretKey == "" {
-		log.Println("ERROR: JWT Secret Key is not configured for token generation.")
+
+	if config.AppConfig == nil || config.AppConfig.HasuraJWTKey == "" || config.AppConfig.HasuraJWTType != "HS256" {
+		log.Println("ERROR: LoginUser Logic: Hasura JWT Key (HS256) not configured.")
 		return nil, errors.New("internal server error: JWT configuration missing")
 	}
-	jwtSecret := []byte(config.AppConfig.JWTSecretKey)
-	expirationTime := time.Now().Add(config.AppConfig.JWTExpiresHour)
+	jwtSecret := []byte(config.AppConfig.HasuraJWTKey)
+	expirationTime := time.Now().Add(24 * time.Hour)
+
+	defaultRole := "student"
+	allowedRoles := []string{"student"}
+	if user.Role {
+		defaultRole = "teacher"
+		allowedRoles = []string{"teacher", "student"}
+	}
 
 	claims := jwt.MapClaims{
-		"userID": user.ID,
-		"role":   user.Role,
-		"exp":    expirationTime.Unix(),
-		"iat":    time.Now().Unix(),
+		"sub": user.Email,
+		"iat": time.Now().Unix(),
+		"exp": expirationTime.Unix(),
+		"https://hasura.io/jwt/claims": map[string]interface{}{
+			"x-hasura-allowed-roles": allowedRoles,
+			"x-hasura-default-role":  defaultRole,
+			"x-hasura-user-id":       strconv.FormatUint(uint64(user.ID), 10),
+		},
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-
 	tokenString, err := token.SignedString(jwtSecret)
 	if err != nil {
-		log.Printf("ERROR: Failed to sign JWT token for user %d: %v", user.ID, err)
+		log.Printf("ERROR: LoginUser Logic: Failed sign Hasura JWT for user %d: %v", user.ID, err)
 		return nil, errors.New("failed to generate authentication token")
 	}
 
-	user.Password = ""
-
+	log.Printf("INFO: LoginUser Logic: User logged in: %s (ID: %d)", user.Email, user.ID)
+	userResult := models.User{
+		ID: user.ID, Fullname: user.Fullname, Email: user.Email,
+		Role: user.Role, CreatedAt: user.CreatedAt, UpdatedAt: user.UpdatedAt,
+	}
 	return map[string]interface{}{
 		"token": tokenString,
-		"user":  user,
+		"user":  userResult,
 	}, nil
 }
 
 func UpdateUser(params graphql.ResolveParams) (interface{}, error) {
-	userID, _, err := requireAuth(params)
+	userIDStr, _, err := requireAuth(params)
 	if err != nil {
 		return nil, err
 	}
-
+	userID, err := getUserIDUint(userIDStr)
+	if err != nil {
+		return nil, err
+	}
 	fullname, fullnameOk := params.Args["fullname"].(string)
 	password, passwordOk := params.Args["password"].(string)
 
 	if !fullnameOk && !passwordOk {
-		return nil, errors.New("no fields provided for update")
+		return nil, errors.New("no fields provided for update (fullname or password required)")
 	}
 
 	var user models.User
 	if err := DB.First(&user, userID).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			log.Printf("WARNING: User %d from token not found in DB for update", userID)
+			log.Printf("WARNING: UpdateUser: User %d (from token ID %s) not found in DB", userID, userIDStr)
 			return nil, errors.New("user not found")
 		}
-		log.Printf("ERROR: Failed to fetch user %d for update: %v", userID, err)
+		log.Printf("ERROR: UpdateUser: Failed fetch user %d: %v", userID, err)
 		return nil, errors.New("failed to retrieve user data")
 	}
 
+	updates := make(map[string]interface{})
 	updated := false
 	if fullnameOk && fullname != "" && user.Fullname != fullname {
-		user.Fullname = fullname
+		updates["Fullname"] = fullname
 		updated = true
 	}
-
 	if passwordOk && password != "" {
 		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 		if err != nil {
-			log.Printf("ERROR: Failed to hash new password for user %d: %v", userID, err)
+			log.Printf("ERROR: UpdateUser: Failed hash new password for user %d: %v", userID, err)
 			return nil, errors.New("failed to process new password")
 		}
-		if string(hashedPassword) != user.Password {
-			user.Password = string(hashedPassword)
-			updated = true
-		}
+		updates["Password"] = string(hashedPassword)
+		updated = true
 	}
 
 	if updated {
-		user.UpdatedAt = time.Now()
-		if err := DB.Save(&user).Error; err != nil {
-			log.Printf("ERROR: Failed to update user %d: %v", userID, err)
+		updates["UpdatedAt"] = time.Now()
+		if err := DB.Model(&user).Updates(updates).Error; err != nil {
+			log.Printf("ERROR: UpdateUser: Failed update user %d: %v", userID, err)
 			return nil, errors.New("failed to update user information")
 		}
+		log.Printf("INFO: UpdateUser: User %d updated.", userID)
+	} else {
+		log.Printf("INFO: UpdateUser: No changes for user %d.", userID)
 	}
-	user.Password = ""
-	return user, nil
+
+	userResult := models.User{
+		ID: user.ID, Fullname: user.Fullname, Email: user.Email,
+		Role: user.Role, CreatedAt: user.CreatedAt, UpdatedAt: user.UpdatedAt,
+	}
+	if updatedVal, ok := updates["UpdatedAt"]; ok {
+		userResult.UpdatedAt = updatedVal.(time.Time)
+	}
+	return userResult, nil
 }
 
 func CreateClass(params graphql.ResolveParams) (interface{}, error) {
-	teacherID, err := requireTeacher(params)
+	teacherIDStr, err := requireTeacher(params)
+	if err != nil {
+		return nil, err
+	}
+	teacherID, err := getUserIDUint(teacherIDStr)
 	if err != nil {
 		return nil, err
 	}
 	name, _ := params.Args["name"].(string)
 	subject, _ := params.Args["subject"].(string)
-	status, _ := params.Args["status"].(bool)
+	statusInput, statusProvided := params.Args["status"].(bool)
 	leaderIDInput, hasLeaderID := params.Args["leaderID"].(int)
 
 	if name == "" || subject == "" {
 		return nil, errors.New("class name and subject are required")
 	}
+	if !statusProvided {
+		statusInput = true
+	}
 
 	class := models.Class{
-		Name:      name,
-		Subject:   subject,
-		TeacherID: &teacherID,
-		Status:    status,
+		Name: name, Subject: subject, TeacherID: &teacherID, Status: statusInput,
 	}
 
 	if hasLeaderID && leaderIDInput > 0 {
@@ -415,89 +474,87 @@ func CreateClass(params graphql.ResolveParams) (interface{}, error) {
 		var potentialLeader models.User
 		if err := DB.Select("id", "role").First(&potentialLeader, leaderID).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return nil, fmt.Errorf("invalid leaderID: user with ID %d not found", leaderID)
+				return nil, fmt.Errorf("invalid leaderID: user %d not found", leaderID)
 			}
-			log.Printf("ERROR: DB error checking leader %d for class creation by teacher %d: %v", leaderID, teacherID, err)
+			log.Printf("ERROR: CreateClass: DB error check leader %d by teacher %d: %v", leaderID, teacherID, err)
 			return nil, errors.New("database error checking leader")
 		}
 		if potentialLeader.Role {
-			return nil, fmt.Errorf("invalid leaderID: user %d is a teacher, not a student", leaderID)
+			return nil, fmt.Errorf("invalid leaderID: user %d is a teacher", leaderID)
 		}
 		class.LeaderID = &leaderID
 	}
 
 	if err := DB.Create(&class).Error; err != nil {
-		log.Printf("ERROR: Failed to create class '%s' by teacher %d: %v", name, teacherID, err)
+		log.Printf("ERROR: CreateClass: Failed for '%s' by teacher %d: %v", name, teacherID, err)
 		return nil, errors.New("failed to create class")
 	}
+	log.Printf("INFO: CreateClass: Class '%s' (ID: %d) created by teacher %d", class.Name, class.ID, teacherID)
 
+	var createdClass models.Class
 	err = DB.Preload("Teacher", func(db *gorm.DB) *gorm.DB {
 		return db.Select("id", "fullname", "email", "role")
 	}).Preload("Leader", func(db *gorm.DB) *gorm.DB {
 		return db.Select("id", "fullname", "email", "role")
-	}).First(&class, class.ID).Error
-
+	}).First(&createdClass, class.ID).Error
 	if err != nil {
-		log.Printf("WARNING: Failed to preload teacher/leader after creating class %d: %v", class.ID, err)
+		log.Printf("WARNING: CreateClass: Failed preload associations class %d: %v", class.ID, err)
+		return class, nil
 	}
-
-	return class, nil
+	return createdClass, nil
 }
 
 func UpdateClass(params graphql.ResolveParams) (interface{}, error) {
-	teacherID, err := requireTeacher(params)
+	teacherIDStr, err := requireTeacher(params)
 	if err != nil {
 		return nil, err
 	}
-
+	teacherID, err := getUserIDUint(teacherIDStr)
+	if err != nil {
+		return nil, err
+	}
 	classIDInput, ok := params.Args["classID"].(int)
 	if !ok || classIDInput <= 0 {
 		return nil, errors.New("invalid classID provided")
 	}
 	classID := uint(classIDInput)
 
-	name, isNameProvided := params.Args["name"].(string)
-	subject, isSubjectProvided := params.Args["subject"].(string)
-	status, isStatusProvided := params.Args["status"].(bool)
-	leaderIDInput, isLeaderIDProvided := params.Args["leaderID"].(int)
-
 	var class models.Class
 	if err := DB.First(&class, classID).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, errors.New("class not found")
 		}
-		log.Printf("ERROR: Failed to fetch class %d for update by teacher %d: %v", classID, teacherID, err)
+		log.Printf("ERROR: UpdateClass: Failed fetch class %d by teacher %d: %v", classID, teacherID, err)
 		return nil, errors.New("failed to retrieve class data")
 	}
-
 	if class.TeacherID == nil || *class.TeacherID != teacherID {
 		return nil, errors.New("authorization error: you are not the teacher of this class")
 	}
 
+	updates := make(map[string]interface{})
 	updated := false
-	if isNameProvided && name != "" && class.Name != name {
-		class.Name = name
+	if name, ok := params.Args["name"].(string); ok && name != "" && class.Name != name {
+		updates["Name"] = name
 		updated = true
 	}
-	if isSubjectProvided && subject != "" && class.Subject != subject {
-		class.Subject = subject
+	if subject, ok := params.Args["subject"].(string); ok && subject != "" && class.Subject != subject {
+		updates["Subject"] = subject
 		updated = true
 	}
-	if isStatusProvided && class.Status != status {
-		class.Status = status
+	if status, ok := params.Args["status"].(bool); ok && class.Status != status {
+		updates["Status"] = status
 		updated = true
 	}
-
-	if isLeaderIDProvided {
+	if leaderIDInput, ok := params.Args["leaderID"].(int); ok {
 		var newLeaderIDPtr *uint
 		if leaderIDInput > 0 {
 			newLeaderID := uint(leaderIDInput)
 			var potentialLeader models.User
 			if err := DB.Select("id", "role").First(&potentialLeader, newLeaderID).Error; err != nil {
 				if errors.Is(err, gorm.ErrRecordNotFound) {
-					return nil, fmt.Errorf("invalid leaderID: user with ID %d not found", newLeaderID)
+					return nil, fmt.Errorf("invalid leaderID: user %d not found", newLeaderID)
 				}
-				log.Printf("ERROR: DB error checking new leader %d for class update %d: %v", newLeaderID, classID, err)
+				log.Printf("ERROR: UpdateClass: DB error check leader %d class %d: %v", newLeaderID, classID, err)
 				return nil, errors.New("database error checking leader")
 			}
 			if potentialLeader.Role {
@@ -505,40 +562,43 @@ func UpdateClass(params graphql.ResolveParams) (interface{}, error) {
 			}
 			newLeaderIDPtr = &newLeaderID
 		}
-
 		if (class.LeaderID == nil && newLeaderIDPtr != nil) || (class.LeaderID != nil && newLeaderIDPtr == nil) || (class.LeaderID != nil && newLeaderIDPtr != nil && *class.LeaderID != *newLeaderIDPtr) {
-			class.LeaderID = newLeaderIDPtr
+			updates["LeaderID"] = newLeaderIDPtr
 			updated = true
 		}
 	}
 
 	if updated {
-		class.UpdatedAt = time.Now()
-		if err := DB.Save(&class).Error; err != nil {
-			log.Printf("ERROR: Failed to update class %d by teacher %d: %v", classID, teacherID, err)
+		updates["UpdatedAt"] = time.Now()
+		if err := DB.Model(&class).Updates(updates).Error; err != nil {
+			log.Printf("ERROR: UpdateClass: Failed for class %d by teacher %d: %v", classID, teacherID, err)
 			return nil, errors.New("failed to update class")
 		}
+		log.Printf("INFO: UpdateClass: Class %d updated by teacher %d", classID, teacherID)
+	} else {
+		log.Printf("INFO: UpdateClass: No changes for class %d.", classID)
 	}
 
-	err = DB.Preload("Teacher", func(db *gorm.DB) *gorm.DB {
-		return db.Select("id", "fullname", "email", "role")
-	}).Preload("Leader", func(db *gorm.DB) *gorm.DB {
-		return db.Select("id", "fullname", "email", "role")
-	}).First(&class, class.ID).Error
-
+	var updatedClass models.Class
+	err = DB.Preload("Teacher", func(db *gorm.DB) *gorm.DB { return db.Select("id", "fullname", "email", "role") }).
+		Preload("Leader", func(db *gorm.DB) *gorm.DB { return db.Select("id", "fullname", "email", "role") }).
+		First(&updatedClass, class.ID).Error
 	if err != nil {
-		log.Printf("WARNING: Failed to preload after updating class %d: %v", class.ID, err)
+		log.Printf("WARNING: UpdateClass: Failed preload associations class %d: %v", class.ID, err)
+		return class, nil
 	}
-
-	return class, nil
+	return updatedClass, nil
 }
 
 func DeleteClass(params graphql.ResolveParams) (interface{}, error) {
-	teacherID, err := requireTeacher(params)
+	teacherIDStr, err := requireTeacher(params)
 	if err != nil {
 		return nil, err
 	}
-
+	teacherID, err := getUserIDUint(teacherIDStr)
+	if err != nil {
+		return nil, err
+	}
 	classIDInput, ok := params.Args["classID"].(int)
 	if !ok || classIDInput <= 0 {
 		return nil, errors.New("invalid classID provided")
@@ -551,130 +611,123 @@ func DeleteClass(params graphql.ResolveParams) (interface{}, error) {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return errors.New("class not found")
 			}
-			log.Printf("ERROR: Failed to fetch class %d for delete by teacher %d: %v", classID, teacherID, err)
+			log.Printf("ERROR: Tx(DeleteClass): Failed fetch class %d by teacher %d: %v", classID, teacherID, err)
 			return errors.New("failed to retrieve class data")
 		}
-
 		if class.TeacherID == nil || *class.TeacherID != teacherID {
 			return errors.New("authorization error: you are not the teacher of this class")
 		}
-
 		var count int64
 		if err := tx.Model(&models.StudentClass{}).Where("class_id = ? AND left_at IS NULL", classID).Count(&count).Error; err != nil {
-			log.Printf("ERROR: Failed to count students for class %d delete: %v", classID, err)
-			return errors.New("failed to count students in class")
+			log.Printf("ERROR: Tx(DeleteClass): Failed count students class %d: %v", classID, err)
+			return errors.New("failed to check student count")
 		}
-
 		if count >= 5 {
-			return fmt.Errorf("cannot delete class: class has %d students (requires less than 5)", count)
+			return fmt.Errorf("cannot delete class: has %d active students (requires < 5)", count)
 		}
-
-		if err := tx.Where("class_id = ?", classID).Delete(&models.StudentClass{}).Error; err != nil {
-			log.Printf("ERROR: Failed to delete student enrollments for class %d: %v", classID, err)
-			return errors.New("failed to remove students before deleting class")
+		if err := tx.Where("class_id = ?", classID).Delete(&models.StudentClass{}).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			log.Printf("ERROR: Tx(DeleteClass): Failed delete enrollments class %d: %v", classID, err)
+			return errors.New("failed to remove student enrollments")
 		}
-
-		if err := tx.Delete(&models.Class{}, classID).Error; err != nil {
-			log.Printf("ERROR: Failed to delete class %d by teacher %d: %v", classID, teacherID, err)
+		result := tx.Delete(&models.Class{}, classID)
+		if result.Error != nil {
+			log.Printf("ERROR: Tx(DeleteClass): Failed delete class %d by teacher %d: %v", classID, teacherID, result.Error)
 			return errors.New("failed to delete class")
 		}
-
+		if result.RowsAffected == 0 {
+			log.Printf("WARN: Tx(DeleteClass): Delete class %d reported 0 rows affected.", classID)
+			return errors.New("failed to delete class (not found during delete step)")
+		}
 		return nil
 	})
-
 	if err != nil {
 		return nil, err
 	}
-
-	log.Printf("INFO: Class %d deleted successfully by teacher %d", classID, teacherID)
-	return fmt.Sprintf("Class %d deleted successfully", classID), nil
+	log.Printf("INFO: DeleteClass: Class %d deleted by teacher %d", classID, teacherID)
+	return map[string]interface{}{"message": fmt.Sprintf("Class %d deleted successfully", classID), "classID": classID}, nil
 }
 
 func JoinClass(params graphql.ResolveParams) (interface{}, error) {
-	studentID, err := requireStudent(params)
+	studentIDStr, err := requireStudent(params)
 	if err != nil {
 		return nil, err
 	}
-
+	studentID, err := getUserIDUint(studentIDStr)
+	if err != nil {
+		return nil, err
+	}
 	classIDInput, ok := params.Args["classID"].(int)
 	if !ok || classIDInput <= 0 {
 		return nil, errors.New("invalid classID provided")
 	}
 	classID := uint(classIDInput)
 
-	var studentClass models.StudentClass
+	var resultingEnrollment models.StudentClass
 	err = DB.Transaction(func(tx *gorm.DB) error {
 		var class models.Class
 		if err := tx.Select("id", "status").First(&class, classID).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return errors.New("class not found")
 			}
-			log.Printf("ERROR: Failed fetch class %d for student %d join: %v", classID, studentID, err)
+			log.Printf("ERROR: Tx(JoinClass): Failed fetch class %d for student %d: %v", classID, studentID, err)
 			return errors.New("failed to retrieve class data")
 		}
-
 		if !class.Status {
 			return errors.New("cannot join class: the class is not open")
 		}
 
 		var existingEnrollment models.StudentClass
 		err = tx.Where("student_id = ? AND class_id = ?", studentID, classID).First(&existingEnrollment).Error
-
 		if err == nil {
 			if existingEnrollment.LeftAt == nil {
 				return errors.New("student already enrolled in this class")
-			} else {
-				existingEnrollment.LeftAt = nil
-				existingEnrollment.EnrolledAt = time.Now()
-				if err := tx.Save(&existingEnrollment).Error; err != nil {
-					log.Printf("ERROR: Failed to rejoin student %d to class %d: %v", studentID, classID, err)
-					return errors.New("failed to rejoin class")
-				}
-				studentClass = existingEnrollment
-				log.Printf("INFO: Student %d rejoined class %d", studentID, classID)
-				return nil
 			}
+			now := time.Now()
+			updateData := map[string]interface{}{"left_at": nil, "enrolled_at": now}
+			if err := tx.Model(&existingEnrollment).Updates(updateData).Error; err != nil {
+				log.Printf("ERROR: Tx(JoinClass): Failed rejoin student %d class %d: %v", studentID, classID, err)
+				return errors.New("failed to rejoin class")
+			}
+			resultingEnrollment = existingEnrollment
+			log.Printf("INFO: Tx(JoinClass): Student %d rejoined class %d", studentID, classID)
+			return nil
 		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-			log.Printf("ERROR: DB error checking enrollment for student %d, class %d: %v", studentID, classID, err)
+			log.Printf("ERROR: Tx(JoinClass): DB error check enrollment student %d, class %d: %v", studentID, classID, err)
 			return errors.New("database error checking enrollment")
 		}
 
-		newEnrollment := models.StudentClass{
-			StudentID:  studentID,
-			ClassID:    classID,
-			EnrolledAt: time.Now(),
-			LeftAt:     nil,
-		}
+		newEnrollment := models.StudentClass{StudentID: studentID, ClassID: classID, EnrolledAt: time.Now(), LeftAt: nil}
 		if err := tx.Create(&newEnrollment).Error; err != nil {
-			log.Printf("ERROR: Failed to join student %d to class %d: %v", studentID, classID, err)
+			log.Printf("ERROR: Tx(JoinClass): Failed create enrollment student %d, class %d: %v", studentID, classID, err)
 			return errors.New("failed to join class")
 		}
-		studentClass = newEnrollment
-		log.Printf("INFO: Student %d joined class %d", studentID, classID)
+		resultingEnrollment = newEnrollment
+		log.Printf("INFO: Tx(JoinClass): Student %d joined class %d", studentID, classID)
 		return nil
 	})
-
 	if err != nil {
 		return nil, err
 	}
 
-	err = DB.Preload("Student", func(db *gorm.DB) *gorm.DB {
-		return db.Select("id", "fullname", "email", "role")
-	}).First(&studentClass, "student_id = ? AND class_id = ?", studentID, classID).Error
-
+	var finalEnrollmentWithStudent models.StudentClass
+	err = DB.Preload("Student", func(db *gorm.DB) *gorm.DB { return db.Select("id", "fullname", "email", "role") }).
+		First(&finalEnrollmentWithStudent, "student_id = ? AND class_id = ?", resultingEnrollment.StudentID, resultingEnrollment.ClassID).Error
 	if err != nil {
-		log.Printf("WARNING: Failed to preload student info after joining class %d: %v", classID, err)
+		log.Printf("WARNING: JoinClass: Failed preload student info class %d: %v", classID, err)
+		return resultingEnrollment, nil
 	}
-
-	return studentClass, nil
+	return finalEnrollmentWithStudent, nil
 }
 
 func LeaveClass(params graphql.ResolveParams) (interface{}, error) {
-	studentID, err := requireStudent(params)
+	studentIDStr, err := requireStudent(params)
 	if err != nil {
 		return nil, err
 	}
-
+	studentID, err := getUserIDUint(studentIDStr)
+	if err != nil {
+		return nil, err
+	}
 	classIDInput, ok := params.Args["classID"].(int)
 	if !ok || classIDInput <= 0 {
 		return nil, errors.New("invalid classID provided")
@@ -683,27 +736,24 @@ func LeaveClass(params graphql.ResolveParams) (interface{}, error) {
 
 	var enrollment models.StudentClass
 	err = DB.Where("student_id = ? AND class_id = ? AND left_at IS NULL", studentID, classID).First(&enrollment).Error
-
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, errors.New("student not currently enrolled in this class")
 		}
-		log.Printf("ERROR: Failed fetch enrollment for student %d, class %d leave: %v", studentID, classID, err)
+		log.Printf("ERROR: LeaveClass: Failed fetch enrollment student %d, class %d: %v", studentID, classID, err)
 		return nil, errors.New("database error finding enrollment")
 	}
+
 	now := time.Now()
 	result := DB.Model(&enrollment).Update("left_at", &now)
-
 	if result.Error != nil {
-		log.Printf("ERROR: Failed to update left_at for student %d, class %d: %v", studentID, classID, result.Error)
+		log.Printf("ERROR: LeaveClass: Failed update left_at student %d, class %d: %v", studentID, classID, result.Error)
 		return nil, errors.New("failed to leave class")
 	}
-
 	if result.RowsAffected == 0 {
-		log.Printf("WARNING: No rows affected when student %d tried to leave class %d", studentID, classID)
-		return nil, errors.New("failed to leave class (no record updated)")
+		log.Printf("WARN: LeaveClass: No rows affected student %d, class %d (already left?)", studentID, classID)
+		return map[string]interface{}{"message": fmt.Sprintf("No active enrollment found to update for student %d in class %d", studentID, classID), "classID": classID}, nil
 	}
-
-	log.Printf("INFO: Student %d left class %d", studentID, classID)
-	return fmt.Sprintf("Successfully left class %d", classID), nil
+	log.Printf("INFO: LeaveClass: Student %d left class %d", studentID, classID)
+	return map[string]interface{}{"message": fmt.Sprintf("Successfully left class %d", classID), "classID": classID}, nil
 }
