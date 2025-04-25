@@ -34,6 +34,24 @@ type graphQLRequestBody struct {
 	Variables     map[string]interface{} `json:"variables"`
 }
 
+func sendGraphQLError(w http.ResponseWriter, message string, statusCode int, errorCode string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	jsonError := map[string]interface{}{
+		"errors": []map[string]interface{}{
+			{
+				"message": message,
+				"extensions": map[string]interface{}{
+					"code": errorCode,
+				},
+			},
+		},
+	}
+	if err := json.NewEncoder(w).Encode(jsonError); err != nil {
+		log.Printf("ERROR: sendGraphQLError: Failed to encode JSON error response: %v", err)
+	}
+}
+
 var publicOperations = map[string]bool{
 	"LoginUser":          true,
 	"RegisterUser":       true,
@@ -44,74 +62,79 @@ func isPublicOperation(r *http.Request) (bool, error) {
 	if r.Method != http.MethodPost || r.URL.Path != "/graphql" {
 		return false, nil
 	}
+
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Printf("ERROR: [isPublicOperation] Không thể đọc request body: %v", err)
-
-		return false, fmt.Errorf("failed to read request body")
+		log.Printf("ERROR: [isPublicOperation] Failed to read request body: %v", err)
+		return false, fmt.Errorf("failed to read request body for public check: %w", err)
 	}
-	r.Body.Close()
+
 	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	log.Printf("DEBUG: [isPublicOperation] Received Request Body: %s", string(bodyBytes))
 
 	var reqBody graphQLRequestBody
 	if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
-
-		log.Printf("DEBUG: [isPublicOperation] Không parse được GraphQL JSON body: %v. Coi như không phải public.", err)
+		log.Printf("DEBUG: [isPublicOperation] Failed to parse GraphQL JSON body: %v. Assuming not public.", err)
 		return false, nil
 	}
 
 	log.Printf("DEBUG: [isPublicOperation] Parsed OperationName: '%s'", reqBody.OperationName)
+	trimmedQuery := strings.TrimSpace(reqBody.Query)
+	log.Printf("DEBUG: [isPublicOperation] Parsed Query (trimmed): '%s'", trimmedQuery)
 
 	if reqBody.OperationName != "" {
 		isPublic := publicOperations[reqBody.OperationName]
-		log.Printf("DEBUG: [isPublicOperation] Kiểm tra OperationName '%s'. Là public? %t", reqBody.OperationName, isPublic)
+		log.Printf("DEBUG: [isPublicOperation] Checking OperationName '%s'. Is public? %t", reqBody.OperationName, isPublic)
 		if isPublic {
 			return true, nil
 		}
+		log.Println("DEBUG: [isPublicOperation] OperationName provided but not public.")
+		return false, nil
 	} else {
+		log.Println("DEBUG: [isPublicOperation] No OperationName provided, checking query string.")
 
-		log.Println("DEBUG: [isPublicOperation] Không có OperationName, kiểm tra query string.")
-		queryTrimmed := strings.TrimSpace(reqBody.Query)
-
-		if strings.HasPrefix(queryTrimmed, "mutation LoginUser") || strings.HasPrefix(queryTrimmed, "mutation loginUser") {
-			log.Println("DEBUG: [isPublicOperation] Query prefix khớp LoginUser. Cho phép.")
-			return true, nil
-		}
-		if strings.HasPrefix(queryTrimmed, "mutation RegisterUser") || strings.HasPrefix(queryTrimmed, "mutation registerUser") {
-			log.Println("DEBUG: [isPublicOperation] Query prefix khớp RegisterUser. Cho phép.")
-			return true, nil
-		}
-
-		if strings.Contains(queryTrimmed, "IntrospectionQuery") {
-			log.Println("DEBUG: [isPublicOperation] Query chứa IntrospectionQuery. Cho phép.")
+		if strings.Contains(trimmedQuery, "IntrospectionQuery") {
+			log.Println("DEBUG: [isPublicOperation] Query contains IntrospectionQuery. Allowing.")
 			return true, nil
 		}
 	}
 
-	log.Println("DEBUG: [isPublicOperation] Operation được xác định là KHÔNG public.")
+	log.Println("DEBUG: [isPublicOperation] Operation determined to be NOT public.")
 	return false, nil
 }
 
 func AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
-		isPublic, readErr := isPublicOperation(r)
+		bodyBytes, readErr := io.ReadAll(r.Body)
 		if readErr != nil {
-			log.Printf("CRITICAL: AuthMiddleware: Lỗi đọc body request: %v", readErr)
-			http.Error(w, "Internal Server Error: Cannot process request", http.StatusInternalServerError)
+			log.Printf("CRITICAL: AuthMiddleware: Failed to read request body initially: %v", readErr)
+			sendGraphQLError(w, "Internal Server Error: Cannot process request body", http.StatusInternalServerError, "INTERNAL_SERVER_ERROR")
 			return
 		}
+		r.Body.Close()
 
+		rForCheck := r.Clone(context.Background())
+		rForCheck.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+		isPublic, checkErr := isPublicOperation(rForCheck)
+		if checkErr != nil {
+			log.Printf("ERROR: AuthMiddleware: Error during isPublicOperation check: %v", checkErr)
+			sendGraphQLError(w, "Internal Server Error: Cannot determine operation public status", http.StatusInternalServerError, "INTERNAL_SERVER_ERROR")
+			return
+		}
 		if isPublic {
-			log.Println("DEBUG: AuthMiddleware: Bỏ qua xác thực cho public GraphQL operation.")
+			log.Println("DEBUG: AuthMiddleware: Skipping authentication for public GraphQL operation.")
 			next.ServeHTTP(w, r)
 			return
 		}
-
-		log.Println("DEBUG: AuthMiddleware: Bắt đầu kiểm tra xác thực cho protected GraphQL operation.")
+		log.Println("DEBUG: AuthMiddleware: Starting authentication check for protected GraphQL operation.")
 
 		if config.AppConfig == nil {
-			log.Println("CRITICAL: AuthMiddleware: Config chưa được load.")
+			log.Println("CRITICAL: AuthMiddleware: Config not loaded.")
 			http.Error(w, "Internal Server Error: Auth config missing", http.StatusInternalServerError)
 			return
 		}
@@ -119,7 +142,7 @@ func AuthMiddleware(next http.Handler) http.Handler {
 		jwtKey := config.AppConfig.HasuraJWTKey
 		jwkURL := config.AppConfig.HasuraJWKURL
 		if jwtType == "HS256" && jwtKey == "" {
-			log.Println("CRITICAL: AuthMiddleware: JWT type HS256 nhưng key bị thiếu.")
+			log.Println("CRITICAL: AuthMiddleware: JWT type HS256 but key is missing.")
 			http.Error(w, "Internal Server Error: Auth config error", http.StatusInternalServerError)
 			return
 		}
@@ -131,9 +154,8 @@ func AuthMiddleware(next http.Handler) http.Handler {
 		}
 
 		if tokenString == "" {
-			log.Println("DEBUG: AuthMiddleware: Không tìm thấy Authorization token cho protected operation.")
-			w.Header().Set("WWW-Authenticate", `Bearer realm="protected api"`)
-			http.Error(w, "Authorization Required", http.StatusUnauthorized)
+			log.Println("DEBUG: AuthMiddleware: Authorization token not found for protected operation.")
+			sendGraphQLError(w, "Authorization Required: Token missing", http.StatusUnauthorized, "UNAUTHENTICATED")
 			return
 		}
 
@@ -150,58 +172,60 @@ func AuthMiddleware(next http.Handler) http.Handler {
 				if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
 					return nil, fmt.Errorf("unexpected signing method: %v, expected %s", token.Header["alg"], jwt.SigningMethodRS256.Alg())
 				}
-				log.Println("WARN: AuthMiddleware: Cần implement logic lấy public key từ JWK URL cho RS256:", jwkURL)
+				log.Println("WARN: AuthMiddleware: RS256 validation logic using JWK URL is required:", jwkURL)
 				return nil, errors.New("RS256 validation not implemented")
 			default:
 				return nil, fmt.Errorf("unsupported jwt type configured: %s", jwtType)
 			}
 		}
+
 		token, err := jwt.ParseWithClaims(tokenString, claims, keyFunc)
+
 		if err != nil {
 
 			log.Printf("WARN: AuthMiddleware: Invalid Token - %v", err)
 			errMsg := "Invalid Token"
+			errCode := "INVALID_TOKEN"
 			if errors.Is(err, jwt.ErrTokenExpired) {
 				errMsg = "Token has expired"
+				errCode = "TOKEN_EXPIRED"
 			} else if errors.Is(err, jwt.ErrTokenSignatureInvalid) {
 				errMsg = "Invalid token signature"
 			} else if strings.Contains(err.Error(), "unexpected signing method") {
 				errMsg = "Invalid token signing method"
 			}
-			w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="`+errMsg+`"`)
-			http.Error(w, errMsg, http.StatusUnauthorized)
+			sendGraphQLError(w, errMsg, http.StatusUnauthorized, errCode)
 			return
 		}
 		if !token.Valid {
-
-			log.Println("WARN: AuthMiddleware: Token parsed nhưng không hợp lệ.")
-			http.Error(w, "Invalid Token", http.StatusUnauthorized)
+			log.Println("WARN: AuthMiddleware: Token parsed but marked invalid.")
+			sendGraphQLError(w, "Invalid Token", http.StatusUnauthorized, "INVALID_TOKEN")
 			return
 		}
 
 		hasuraClaims := claims.HasuraNamespace
 		if hasuraClaims == nil {
-			log.Println("ERROR: AuthMiddleware: Thiếu namespace 'https://hasura.io/jwt/claims'.")
-			http.Error(w, "Forbidden: Missing required claims namespace", http.StatusForbidden)
+			log.Println("ERROR: AuthMiddleware: Missing 'https://hasura.io/jwt/claims' namespace.")
+			sendGraphQLError(w, "Forbidden: Missing required claims namespace", http.StatusForbidden, "FORBIDDEN_MISSING_CLAIMS")
 			return
 		}
 		userIDStr, okUserID := hasuraClaims["x-hasura-user-id"].(string)
 		if !okUserID || userIDStr == "" {
-			log.Println("ERROR: AuthMiddleware: Thiếu hoặc sai định dạng 'x-hasura-user-id' (string).")
-			http.Error(w, "Forbidden: Invalid user claim", http.StatusForbidden)
+			log.Println("ERROR: AuthMiddleware: Missing or invalid 'x-hasura-user-id' (string).")
+			sendGraphQLError(w, "Forbidden: Invalid user claim", http.StatusForbidden, "FORBIDDEN_INVALID_USER_CLAIM")
 			return
 		}
 		defaultRole, okRole := hasuraClaims["x-hasura-default-role"].(string)
 		if !okRole || defaultRole == "" {
-			log.Println("ERROR: AuthMiddleware: Thiếu hoặc sai định dạng 'x-hasura-default-role' (string).")
-			http.Error(w, "Forbidden: Invalid role claim", http.StatusForbidden)
+			log.Println("ERROR: AuthMiddleware: Missing or invalid 'x-hasura-default-role' (string).")
+			sendGraphQLError(w, "Forbidden: Invalid role claim", http.StatusForbidden, "FORBIDDEN_INVALID_ROLE_CLAIM")
 			return
 		}
 		allowedRoles := []string{}
 		allowedRolesRaw, okAllowed := hasuraClaims["x-hasura-allowed-roles"].([]interface{})
 		if !okAllowed {
-			log.Println("ERROR: AuthMiddleware: Thiếu claim 'x-hasura-allowed-roles'.")
-			http.Error(w, "Forbidden: Missing allowed roles claim", http.StatusForbidden)
+			log.Println("ERROR: AuthMiddleware: Missing 'x-hasura-allowed-roles' claim.")
+			sendGraphQLError(w, "Forbidden: Missing allowed roles claim", http.StatusForbidden, "FORBIDDEN_MISSING_ALLOWED_ROLES")
 			return
 		}
 		validRoleFound := false
@@ -212,17 +236,17 @@ func AuthMiddleware(next http.Handler) http.Handler {
 					validRoleFound = true
 				}
 			} else {
-				log.Printf("WARN: AuthMiddleware: Giá trị không phải string trong 'x-hasura-allowed-roles': %T %v", r, r)
+				log.Printf("WARN: AuthMiddleware: Non-string value found in 'x-hasura-allowed-roles': %T %v", r, r)
 			}
 		}
 		if len(allowedRoles) == 0 {
-			log.Println("ERROR: AuthMiddleware: 'x-hasura-allowed-roles' rỗng sau khi xử lý.")
-			http.Error(w, "Forbidden: No valid allowed roles specified", http.StatusForbidden)
+			log.Println("ERROR: AuthMiddleware: 'x-hasura-allowed-roles' is empty after processing.")
+			sendGraphQLError(w, "Forbidden: No valid allowed roles specified", http.StatusForbidden, "FORBIDDEN_NO_VALID_ROLES")
 			return
 		}
 		if !validRoleFound {
-			log.Printf("ERROR: AuthMiddleware: Default role '%s' không có trong allowed roles: %v", defaultRole, allowedRoles)
-			http.Error(w, "Forbidden: Default role not allowed", http.StatusForbidden)
+			log.Printf("ERROR: AuthMiddleware: Default role '%s' not found in allowed roles: %v", defaultRole, allowedRoles)
+			sendGraphQLError(w, "Forbidden: Default role not allowed", http.StatusForbidden, "FORBIDDEN_DEFAULT_ROLE_NOT_ALLOWED")
 			return
 		}
 
@@ -239,11 +263,13 @@ func GetUserIDFromContext(ctx context.Context) (string, bool) {
 	userID, ok := ctx.Value(UserIDKey).(string)
 	return userID, ok && userID != ""
 }
+
 func GetRoleFromContext(ctx context.Context) (string, bool) {
 	role, ok := ctx.Value(RoleKey).(string)
 	return role, ok && role != ""
 }
+
 func GetAllowedRolesFromContext(ctx context.Context) ([]string, bool) {
 	roles, ok := ctx.Value(AllowedRolesKey).([]string)
-	return roles, ok
+	return roles, ok && len(roles) > 0
 }

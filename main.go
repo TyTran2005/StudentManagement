@@ -8,6 +8,7 @@ import (
 	"student-management-api/internal/config"
 	"student-management-api/internal/database"
 	"student-management-api/internal/graphql"
+	"student-management-api/internal/handlers"
 	"student-management-api/internal/middleware"
 	"student-management-api/internal/resolvers"
 
@@ -59,13 +60,15 @@ func main() {
 	gqlHandler := gqlhandler.New(&gqlhandler.Config{
 		Schema:     &graphql.Schema,
 		Pretty:     true,
-		GraphiQL:   true,
+		GraphiQL:   false,
 		Playground: false,
 	})
 
 	mux := http.NewServeMux()
 
 	mux.Handle("/graphql", middleware.AuthMiddleware(gqlHandler))
+
+	mux.HandleFunc("/auth/webhook", handlers.AuthWebhookHandler(db))
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		sqlDB, err := db.DB()
@@ -83,8 +86,8 @@ func main() {
 
 	serverAddr := ":" + cfg.ServerPort
 	log.Printf("INFO: Starting server on %s", serverAddr)
-	log.Printf("INFO: GraphQL endpoint: http://localhost%s/graphql", serverAddr)
-	log.Printf("INFO: GraphiQL UI available at http://localhost%s/graphql", serverAddr)
+	log.Printf("INFO: Custom GraphQL endpoint (for Hasura Remote Schema): http://localhost%s/graphql", serverAddr)
+	log.Printf("INFO: Hasura Auth Webhook endpoint: POST /auth/webhook")
 	log.Printf("INFO: Health check endpoint: GET /health")
 
 	if err := http.ListenAndServe(serverAddr, mux); err != nil {
