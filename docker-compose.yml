@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:14
@@ -36,7 +34,7 @@ services:
       HASURA_GRAPHQL_AUTH_HOOK_MODE: POST    
       HASURA_GRAPHQL_LOG_LEVEL: debug 
       HASURA_GRAPHQL_ENABLE_REMOTE_SCHEMA_PERMISSIONS: "true"               
-
+      
   app:
     build:
       context: .
