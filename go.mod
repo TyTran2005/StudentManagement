@@ -3,6 +3,7 @@ module student-management-api
 go 1.24.2
 
 require (
+	github.com/MicahParks/keyfunc v1.9.0
 	github.com/golang-jwt/jwt/v4 v4.5.2
 	github.com/golang-migrate/migrate/v4 v4.18.2
 	github.com/graphql-go/graphql v0.8.1

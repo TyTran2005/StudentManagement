@@ -14,6 +14,7 @@ import (
 	"github.com/graphql-go/graphql"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 var DB *gorm.DB
@@ -33,11 +34,9 @@ func requireRole(params graphql.ResolveParams, requiredRole string) (string, err
 	}
 	return userIDStr, nil
 }
-
 func requireTeacher(params graphql.ResolveParams) (string, error) {
 	return requireRole(params, "teacher")
 }
-
 func requireStudent(params graphql.ResolveParams) (string, error) {
 	return requireRole(params, "student")
 }
@@ -456,52 +455,79 @@ func CreateClass(params graphql.ResolveParams) (interface{}, error) {
 	name, _ := params.Args["name"].(string)
 	subject, _ := params.Args["subject"].(string)
 	statusInput, statusProvided := params.Args["status"].(bool)
+	if !statusProvided {
+		statusInput = true
+	}
 	leaderIDInput, hasLeaderID := params.Args["leaderID"].(int)
+	var leaderIDPtr *uint
 
 	if name == "" || subject == "" {
 		return nil, errors.New("class name and subject are required")
 	}
-	if !statusProvided {
-		statusInput = true
-	}
-
-	class := models.Class{
-		Name: name, Subject: subject, TeacherID: &teacherID, Status: statusInput,
-	}
-
-	if hasLeaderID && leaderIDInput > 0 {
-		leaderID := uint(leaderIDInput)
-		var potentialLeader models.User
-		if err := DB.Select("id", "role").First(&potentialLeader, leaderID).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return nil, fmt.Errorf("invalid leaderID: user %d not found", leaderID)
-			}
-			log.Printf("ERROR: CreateClass: DB error check leader %d by teacher %d: %v", leaderID, teacherID, err)
-			return nil, errors.New("database error checking leader")
-		}
-		if potentialLeader.Role {
-			return nil, fmt.Errorf("invalid leaderID: user %d is a teacher", leaderID)
-		}
-		class.LeaderID = &leaderID
-	}
-
-	if err := DB.Create(&class).Error; err != nil {
-		log.Printf("ERROR: CreateClass: Failed for '%s' by teacher %d: %v", name, teacherID, err)
-		return nil, errors.New("failed to create class")
-	}
-	log.Printf("INFO: CreateClass: Class '%s' (ID: %d) created by teacher %d", class.Name, class.ID, teacherID)
-
 	var createdClass models.Class
-	err = DB.Preload("Teacher", func(db *gorm.DB) *gorm.DB {
+
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		if hasLeaderID && leaderIDInput > 0 {
+			tempLeaderID := uint(leaderIDInput)
+			var potentialLeader models.User
+			if err := tx.Select("id", "role").First(&potentialLeader, tempLeaderID).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return fmt.Errorf("invalid leaderID: user %d not found", tempLeaderID)
+				}
+				log.Printf("ERROR: CreateClass TX: DB error check leader %d by teacher %d: %v", tempLeaderID, teacherID, err)
+				return errors.New("database error checking leader")
+			}
+			if potentialLeader.Role {
+				return fmt.Errorf("invalid leaderID: user %d is a teacher", tempLeaderID)
+			}
+			leaderIDPtr = &tempLeaderID
+		}
+		classToCreate := models.Class{
+			Name:      name,
+			Subject:   subject,
+			TeacherID: &teacherID,
+			Status:    statusInput,
+			LeaderID:  leaderIDPtr,
+		}
+		if err := tx.Create(&classToCreate).Error; err != nil {
+			log.Printf("ERROR: CreateClass TX: Failed for '%s' by teacher %d: %v", name, teacherID, err)
+			return errors.New("failed to create class")
+		}
+		log.Printf("INFO: CreateClass TX: Class '%s' (temp ID before commit: %d) created by teacher %d", classToCreate.Name, classToCreate.ID, teacherID)
+
+		if classToCreate.LeaderID != nil {
+			enrollment := models.StudentClass{
+				StudentID:  *classToCreate.LeaderID,
+				ClassID:    classToCreate.ID,
+				EnrolledAt: time.Now(),
+				LeftAt:     nil,
+			}
+			if err := tx.Create(&enrollment).Error; err != nil {
+				log.Printf("ERROR: CreateClass TX: Failed to auto-enroll leader %d for class %d: %v", *classToCreate.LeaderID, classToCreate.ID, err)
+				return errors.New("failed to enroll class leader")
+			}
+			log.Printf("INFO: CreateClass TX: Auto-enrolled leader %d for class %d", *classToCreate.LeaderID, classToCreate.ID)
+		}
+		createdClass = classToCreate
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	var finalClassResult models.Class
+	loadErr := DB.Preload("Teacher", func(db *gorm.DB) *gorm.DB {
 		return db.Select("id", "fullname", "email", "role")
 	}).Preload("Leader", func(db *gorm.DB) *gorm.DB {
 		return db.Select("id", "fullname", "email", "role")
-	}).First(&createdClass, class.ID).Error
-	if err != nil {
-		log.Printf("WARNING: CreateClass: Failed preload associations class %d: %v", class.ID, err)
-		return class, nil
+	}).First(&finalClassResult, createdClass.ID).Error
+
+	if loadErr != nil {
+		log.Printf("WARNING: CreateClass: Failed to reload created class %d with associations: %v", createdClass.ID, loadErr)
+		return createdClass, nil
 	}
-	return createdClass, nil
+
+	log.Printf("INFO: CreateClass: Successfully created and potentially enrolled leader for class ID %d", finalClassResult.ID)
+	return finalClassResult, nil
 }
 
 func UpdateClass(params graphql.ResolveParams) (interface{}, error) {
@@ -513,81 +539,137 @@ func UpdateClass(params graphql.ResolveParams) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	classIDInput, ok := params.Args["classID"].(int)
 	if !ok || classIDInput <= 0 {
 		return nil, errors.New("invalid classID provided")
 	}
 	classID := uint(classIDInput)
 
-	var class models.Class
-	if err := DB.First(&class, classID).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, errors.New("class not found")
-		}
-		log.Printf("ERROR: UpdateClass: Failed fetch class %d by teacher %d: %v", classID, teacherID, err)
-		return nil, errors.New("failed to retrieve class data")
-	}
-	if class.TeacherID == nil || *class.TeacherID != teacherID {
-		return nil, errors.New("authorization error: you are not the teacher of this class")
-	}
+	var updatedClassResult models.Class
 
-	updates := make(map[string]interface{})
-	updated := false
-	if name, ok := params.Args["name"].(string); ok && name != "" && class.Name != name {
-		updates["Name"] = name
-		updated = true
-	}
-	if subject, ok := params.Args["subject"].(string); ok && subject != "" && class.Subject != subject {
-		updates["Subject"] = subject
-		updated = true
-	}
-	if status, ok := params.Args["status"].(bool); ok && class.Status != status {
-		updates["Status"] = status
-		updated = true
-	}
-	if leaderIDInput, ok := params.Args["leaderID"].(int); ok {
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		var class models.Class
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&class, classID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errors.New("class not found")
+			}
+			log.Printf("ERROR: UpdateClass TX: Failed fetch/lock class %d by teacher %d: %v", classID, teacherID, err)
+			return errors.New("failed to retrieve class data")
+		}
+
+		if class.TeacherID == nil || *class.TeacherID != teacherID {
+			return errors.New("authorization error: you are not the teacher of this class")
+		}
+
+		updates := make(map[string]interface{})
+		needsDBUpdate := false
+		leaderChanged := false
+		var oldLeaderIDPtr *uint = class.LeaderID
 		var newLeaderIDPtr *uint
-		if leaderIDInput > 0 {
-			newLeaderID := uint(leaderIDInput)
-			var potentialLeader models.User
-			if err := DB.Select("id", "role").First(&potentialLeader, newLeaderID).Error; err != nil {
-				if errors.Is(err, gorm.ErrRecordNotFound) {
-					return nil, fmt.Errorf("invalid leaderID: user %d not found", newLeaderID)
+
+		if name, ok := params.Args["name"].(string); ok && name != "" && class.Name != name {
+			updates["Name"] = name
+			needsDBUpdate = true
+		}
+		if subject, ok := params.Args["subject"].(string); ok && subject != "" && class.Subject != subject {
+			updates["Subject"] = subject
+			needsDBUpdate = true
+		}
+		if status, ok := params.Args["status"].(bool); ok && class.Status != status {
+			updates["Status"] = status
+			needsDBUpdate = true
+		}
+
+		rawLeaderID, leaderIDProvided := params.Args["leaderID"]
+		if leaderIDProvided {
+			leaderIDInput, isInt := rawLeaderID.(int)
+			if !isInt || leaderIDInput <= 0 {
+				newLeaderIDPtr = nil
+			} else {
+				tempLeaderID := uint(leaderIDInput)
+				var potentialLeader models.User
+				if err := tx.Select("id", "role").First(&potentialLeader, tempLeaderID).Error; err != nil {
+					if errors.Is(err, gorm.ErrRecordNotFound) {
+						return fmt.Errorf("invalid leaderID: user %d not found", tempLeaderID)
+					}
+					log.Printf("ERROR: UpdateClass TX: DB error check new leader %d: %v", tempLeaderID, err)
+					return errors.New("database error checking leader")
 				}
-				log.Printf("ERROR: UpdateClass: DB error check leader %d class %d: %v", newLeaderID, classID, err)
-				return nil, errors.New("database error checking leader")
+				if potentialLeader.Role {
+					return fmt.Errorf("invalid leaderID: user %d is a teacher", tempLeaderID)
+				}
+				newLeaderIDPtr = &tempLeaderID
 			}
-			if potentialLeader.Role {
-				return nil, fmt.Errorf("invalid leaderID: user %d is a teacher", newLeaderID)
+
+			if (oldLeaderIDPtr == nil && newLeaderIDPtr != nil) ||
+				(oldLeaderIDPtr != nil && newLeaderIDPtr == nil) ||
+				(oldLeaderIDPtr != nil && newLeaderIDPtr != nil && *oldLeaderIDPtr != *newLeaderIDPtr) {
+				updates["LeaderID"] = newLeaderIDPtr
+				needsDBUpdate = true
+				leaderChanged = true
 			}
-			newLeaderIDPtr = &newLeaderID
 		}
-		if (class.LeaderID == nil && newLeaderIDPtr != nil) || (class.LeaderID != nil && newLeaderIDPtr == nil) || (class.LeaderID != nil && newLeaderIDPtr != nil && *class.LeaderID != *newLeaderIDPtr) {
-			updates["LeaderID"] = newLeaderIDPtr
-			updated = true
+		if needsDBUpdate {
+			updates["UpdatedAt"] = time.Now()
+			if err := tx.Model(&class).Updates(updates).Error; err != nil {
+				log.Printf("ERROR: UpdateClass TX: Failed DB update for class %d: %v", classID, err)
+				return errors.New("failed to update class information")
+			}
+			log.Printf("INFO: UpdateClass TX: Updated fields for class %d", classID)
 		}
-	}
+		if leaderChanged && newLeaderIDPtr != nil {
+			newLeaderID := *newLeaderIDPtr
+			log.Printf("INFO: UpdateClass TX: Leader changed to %d for class %d. Checking enrollment.", newLeaderID, classID)
 
-	if updated {
-		updates["UpdatedAt"] = time.Now()
-		if err := DB.Model(&class).Updates(updates).Error; err != nil {
-			log.Printf("ERROR: UpdateClass: Failed for class %d by teacher %d: %v", classID, teacherID, err)
-			return nil, errors.New("failed to update class")
-		}
-		log.Printf("INFO: UpdateClass: Class %d updated by teacher %d", classID, teacherID)
-	} else {
-		log.Printf("INFO: UpdateClass: No changes for class %d.", classID)
-	}
+			var existingEnrollment models.StudentClass
+			errCheck := tx.Where("student_id = ? AND class_id = ?", newLeaderID, classID).First(&existingEnrollment).Error
 
-	var updatedClass models.Class
-	err = DB.Preload("Teacher", func(db *gorm.DB) *gorm.DB { return db.Select("id", "fullname", "email", "role") }).
-		Preload("Leader", func(db *gorm.DB) *gorm.DB { return db.Select("id", "fullname", "email", "role") }).
-		First(&updatedClass, class.ID).Error
+			if errors.Is(errCheck, gorm.ErrRecordNotFound) {
+				enrollment := models.StudentClass{
+					StudentID:  newLeaderID,
+					ClassID:    classID,
+					EnrolledAt: time.Now(),
+					LeftAt:     nil,
+				}
+				if err := tx.Create(&enrollment).Error; err != nil {
+					log.Printf("ERROR: UpdateClass TX: Failed to auto-enroll new leader %d for class %d: %v", newLeaderID, classID, err)
+					return errors.New("failed to enroll new class leader")
+				}
+				log.Printf("INFO: UpdateClass TX: Auto-enrolled new leader %d for class %d", newLeaderID, classID)
+			} else if errCheck == nil {
+				if existingEnrollment.LeftAt != nil {
+					if err := tx.Model(&existingEnrollment).Update("left_at", nil).Error; err != nil {
+						log.Printf("ERROR: UpdateClass TX: Failed to re-enroll new leader %d for class %d: %v", newLeaderID, classID, err)
+						return errors.New("failed to re-enroll new class leader")
+					}
+					log.Printf("INFO: UpdateClass TX: Re-enrolled new leader %d for class %d", newLeaderID, classID)
+				} else {
+					log.Printf("INFO: UpdateClass TX: New leader %d already actively enrolled in class %d", newLeaderID, classID)
+				}
+			} else {
+				log.Printf("ERROR: UpdateClass TX: DB error checking enrollment for new leader %d class %d: %v", newLeaderID, classID, errCheck)
+				return errors.New("database error checking leader enrollment")
+			}
+		} else if leaderChanged && newLeaderIDPtr == nil {
+			log.Printf("INFO: UpdateClass TX: Leader removed for class %d.", classID)
+
+		}
+		loadErr := tx.Preload("Teacher", func(db *gorm.DB) *gorm.DB { return db.Select("id", "fullname", "email", "role") }).
+			Preload("Leader", func(db *gorm.DB) *gorm.DB { return db.Select("id", "fullname", "email", "role") }).
+			First(&updatedClassResult, classID).Error
+
+		if loadErr != nil {
+			log.Printf("ERROR: UpdateClass TX: Failed to reload updated class %d after potential changes: %v", classID, loadErr)
+			return errors.New("failed to retrieve final class details after update")
+		}
+		return nil
+	})
 	if err != nil {
-		log.Printf("WARNING: UpdateClass: Failed preload associations class %d: %v", class.ID, err)
-		return class, nil
+		return nil, err
 	}
-	return updatedClass, nil
+	log.Printf("INFO: UpdateClass: Successfully processed update request for class %d.", classID)
+	return updatedClassResult, nil
 }
 
 func DeleteClass(params graphql.ResolveParams) (interface{}, error) {

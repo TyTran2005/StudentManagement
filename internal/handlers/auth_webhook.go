@@ -9,6 +9,7 @@ import (
 	"strings"
 	"student-management-api/internal/config"
 
+	"github.com/MicahParks/keyfunc"
 	"github.com/golang-jwt/jwt/v4"
 	"gorm.io/gorm"
 )
@@ -25,104 +26,78 @@ type AuthWebhookResponse struct {
 }
 
 func AuthWebhookHandler(db *gorm.DB) http.HandlerFunc {
+	var jwks *keyfunc.JWKS
+	if config.AppConfig.HasuraJWTType == "RS256" {
+		var err error
+		jwks, err = keyfunc.Get(config.AppConfig.HasuraJWKURL, keyfunc.Options{})
+		if err != nil {
+			log.Fatalf("FATAL: cannot load JWKs from %s: %v", config.AppConfig.HasuraJWKURL, err)
+		}
+		log.Println("INFO: JWKs loaded for RS256 validation.")
+	}
+
 	return func(w http.ResponseWriter, r *http.Request) {
 		log.Println("INFO: AuthWebhookHandler: Received request")
 
 		authHeader := r.Header.Get("Authorization")
-		tokenString := ""
-		if authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
-			tokenString = strings.TrimPrefix(authHeader, "Bearer ")
-		}
-
-		if tokenString == "" {
-			log.Println("WARN: AuthWebhookHandler: No Authorization token found.")
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(map[string]string{"message": "Unauthorized: Missing token"})
+		if authHeader == "" {
+			http.Error(w, "Unauthorized: Missing token", http.StatusUnauthorized)
 			return
 		}
-
-		jwtType := config.AppConfig.HasuraJWTType
-		jwtKey := config.AppConfig.HasuraJWTKey
-		jwkURL := config.AppConfig.HasuraJWKURL
+		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
 
 		claims := &HasuraClaims{}
 		keyFunc := func(token *jwt.Token) (interface{}, error) {
-			switch jwtType {
+			switch config.AppConfig.HasuraJWTType {
 			case "HS256":
 				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 					return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 				}
-				if jwtKey == "" {
-					return nil, errors.New("HS256 key is missing in config")
+				if config.AppConfig.HasuraJWTKey == "" {
+					return nil, errors.New("HS256 key missing in config")
 				}
-				return []byte(jwtKey), nil
+				return []byte(config.AppConfig.HasuraJWTKey), nil
+
 			case "RS256":
-				log.Println("WARN: AuthWebhookHandler: RS256 validation needs implementation using JWK URL:", jwkURL)
-				return nil, errors.New("RS256 validation not implemented")
+				if jwks == nil {
+					return nil, errors.New("RS256 JWKs not initialized")
+				}
+				return jwks.Keyfunc(token)
 			default:
-				return nil, fmt.Errorf("unsupported jwt type: %s", jwtType)
+				return nil, fmt.Errorf("unsupported jwt type: %s", config.AppConfig.HasuraJWTType)
 			}
 		}
 
 		token, err := jwt.ParseWithClaims(tokenString, claims, keyFunc)
 		if err != nil {
-			log.Printf("WARN: AuthWebhookHandler: Invalid Token - %v", err)
-			errMsg := "Invalid Token"
+			log.Printf("WARN: Invalid token: %v", err)
+			msg := "Invalid Token"
 			if errors.Is(err, jwt.ErrTokenExpired) {
-				errMsg = "Token has expired"
-			} else if validationErr, ok := err.(*jwt.ValidationError); ok {
-				if validationErr.Errors&jwt.ValidationErrorSignatureInvalid != 0 {
-					errMsg = "Invalid token signature"
-				} else if validationErr.Errors&jwt.ValidationErrorMalformed != 0 {
-					errMsg = "Malformed token"
-				}
+				msg = "Token has expired"
 			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(map[string]string{"message": errMsg})
+			http.Error(w, msg, http.StatusUnauthorized)
 			return
 		}
 
 		if !token.Valid {
-			log.Println("WARN: AuthWebhookHandler: Token parsed but invalid.")
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(map[string]string{"message": "Invalid Token"})
+			http.Error(w, "Invalid Token", http.StatusUnauthorized)
 			return
 		}
 
-		hasuraClaims := claims.HasuraNamespace
-		if hasuraClaims == nil {
-			log.Println("ERROR: AuthWebhookHandler: Missing 'https://hasura.io/jwt/claims' namespace.")
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusForbidden)
-			json.NewEncoder(w).Encode(map[string]string{"message": "Forbidden: Missing required claims namespace"})
+		ns := claims.HasuraNamespace
+		if ns == nil {
+			http.Error(w, "Forbidden: Missing required claims namespace", http.StatusForbidden)
 			return
 		}
-
-		userIDStr, okUserID := hasuraClaims["x-hasura-user-id"].(string)
-		defaultRole, okRole := hasuraClaims["x-hasura-default-role"].(string)
-
-		if !okUserID || userIDStr == "" || !okRole || defaultRole == "" {
-			log.Println("ERROR: AuthWebhookHandler: Missing or invalid user-id or default-role in claims.")
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusForbidden)
-			json.NewEncoder(w).Encode(map[string]string{"message": "Forbidden: Invalid claims data"})
+		userID, ok1 := ns["x-hasura-user-id"].(string)
+		role, ok2 := ns["x-hasura-default-role"].(string)
+		if !ok1 || !ok2 || userID == "" || role == "" {
+			http.Error(w, "Forbidden: Invalid claims data", http.StatusForbidden)
 			return
 		}
-		response := AuthWebhookResponse{
-			UserID: userIDStr,
-			Role:   defaultRole,
-			Status: "success",
-		}
-
-		log.Printf("INFO: AuthWebhookHandler: Responding to Hasura with UserID: %s, Role: %s, Status: %s", response.UserID, response.Role, response.Status)
-
+		resp := AuthWebhookResponse{UserID: userID, Role: role, Status: "success"}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		if err := json.NewEncoder(w).Encode(response); err != nil {
-			log.Printf("ERROR: AuthWebhookHandler: Failed to encode response: %v", err)
-		}
+		json.NewEncoder(w).Encode(resp)
+		log.Printf("INFO: AuthWebhookHandler: ok user=%s role=%s", userID, role)
 	}
 }
