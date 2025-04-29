@@ -89,18 +89,25 @@ func isPublicOperation(r *http.Request) (bool, error) {
 		if isPublic {
 			return true, nil
 		}
-		log.Println("DEBUG: [isPublicOperation] OperationName provided but not public.")
-		return false, nil
+		log.Println("DEBUG: [isPublicOperation] OperationName provided but not public. Proceeding to check query string.")
 	} else {
 		log.Println("DEBUG: [isPublicOperation] No OperationName provided, checking query string.")
-
-		if strings.Contains(trimmedQuery, "IntrospectionQuery") {
-			log.Println("DEBUG: [isPublicOperation] Query contains IntrospectionQuery. Allowing.")
-			return true, nil
-		}
 	}
 
-	log.Println("DEBUG: [isPublicOperation] Operation determined to be NOT public.")
+	if strings.Contains(trimmedQuery, "IntrospectionQuery") {
+		log.Println("DEBUG: [isPublicOperation] Query contains IntrospectionQuery. Allowing.")
+		return true, nil
+	}
+	if strings.HasPrefix(trimmedQuery, "mutation LoginUser") {
+		log.Println("DEBUG: [isPublicOperation] Query starts with 'mutation LoginUser'. Allowing.")
+		return true, nil
+	}
+	if strings.HasPrefix(trimmedQuery, "mutation RegisterUser") {
+		log.Println("DEBUG: [isPublicOperation] Query starts with 'mutation RegisterUser'. Allowing.")
+		return true, nil
+	}
+
+	log.Println("DEBUG: [isPublicOperation] Operation determined to be NOT public after checking name and query.")
 	return false, nil
 }
 
