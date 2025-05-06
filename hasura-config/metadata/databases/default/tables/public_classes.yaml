@@ -1,0 +1,34 @@
+table:
+  name: classes
+  schema: public
+object_relationships:
+  - name: userByLeaderId
+    using:
+      foreign_key_constraint_on: leader_id
+  - name: userByTeacherId
+    using:
+      foreign_key_constraint_on: teacher_id
+array_relationships:
+  - name: student_classes
+    using:
+      foreign_key_constraint_on:
+        column: class_id
+        table:
+          name: student_classes
+          schema: public
+select_permissions:
+  - role: student
+    permission:
+      columns:
+        - id
+        - leader_id
+        - name
+        - status
+        - subject
+        - teacher_id
+      filter:
+        student_classes:
+          student_id:
+            _eq: X-Hasura-User-Id
+      limit: 20
+    comment: ""

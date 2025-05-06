@@ -1,0 +1,46 @@
+input SampleInput {
+  username: String!
+  password: String!
+}
+
+type SampleOutput {
+  accessToken: String!
+}
+
+type classes_ActionType {
+  created_at: timestamptz!
+  id: Int!
+  leader_id: Int
+  name: String!
+  status: Boolean!
+  subject: String!
+  teacher_id: Int
+  updated_at: timestamptz!
+}
+
+type student_classes_ActionType {
+  class_id: Int!
+  enrolled_at: timestamptz!
+  left_at: timestamptz
+  student_id: Int!
+}
+
+type users_ActionType {
+  created_at: timestamptz!
+  email: String!
+  fullname: String!
+  id: Int!
+  password: String!
+  role: Boolean!
+  updated_at: timestamptz!
+}
+
+type MyQueryOutput {
+  id: Int!
+  leader_id: Int
+  name: String!
+  status: Boolean!
+  subject: String!
+  teacher_id: Int
+}
+

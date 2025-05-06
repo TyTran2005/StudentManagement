@@ -1,0 +1,34 @@
+table:
+  name: users
+  schema: public
+array_relationships:
+  - name: classes
+    using:
+      foreign_key_constraint_on:
+        column: leader_id
+        table:
+          name: classes
+          schema: public
+  - name: classesByTeacherId
+    using:
+      foreign_key_constraint_on:
+        column: teacher_id
+        table:
+          name: classes
+          schema: public
+  - name: student_classes
+    using:
+      foreign_key_constraint_on:
+        column: student_id
+        table:
+          name: student_classes
+          schema: public
+select_permissions:
+  - role: student
+    permission:
+      columns: []
+      filter:
+        student_classes:
+          student_id:
+            _eq: X-Hasura-User-Id
+    comment: ""

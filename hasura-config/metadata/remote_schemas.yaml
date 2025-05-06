@@ -1,0 +1,8 @@
+- name: go_app
+  definition:
+    url: http://app:8080/graphql
+    timeout_seconds: 60
+    customization:
+      root_fields_namespace: Remote_schema
+    forward_client_headers: true
+  comment: ""
