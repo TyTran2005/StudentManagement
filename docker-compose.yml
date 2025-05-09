@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:14
-    container_name: postgres
+    container_name: postgres_student
     environment:
       POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
