@@ -1,2 +1,3 @@
 hasuma-api/
 internal/database/migrations/
+.env

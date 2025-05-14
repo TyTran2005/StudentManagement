@@ -3,7 +3,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"student-management-api/internal/config"
 	"student-management-api/internal/database"
@@ -12,7 +11,10 @@ import (
 	"student-management-api/internal/middleware"
 	"student-management-api/internal/resolvers"
 
+	"github.com/gin-gonic/gin"
 	gqlhandler "github.com/graphql-go/handler"
+
+	"log"
 
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
@@ -64,33 +66,32 @@ func main() {
 		Playground: false,
 	})
 
-	mux := http.NewServeMux()
+	router := gin.Default()
 
-	mux.Handle("/graphql", middleware.AuthMiddleware(gqlHandler))
+	router.POST("/graphql", gin.WrapH(middleware.AuthMiddleware(gqlHandler)))
 
-	mux.HandleFunc("/auth/webhook", handlers.AuthWebhookHandler(db))
+	router.POST("/auth/webhook", gin.WrapF(handlers.AuthWebhookHandler(db)))
 
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	router.GET("/health", func(c *gin.Context) {
 		sqlDB, err := db.DB()
 		if err != nil {
-			http.Error(w, "Failed DB conn", http.StatusInternalServerError)
+			c.String(http.StatusInternalServerError, "Failed DB conn: %v", err)
 			return
 		}
 		if err := sqlDB.Ping(); err != nil {
-			http.Error(w, "DB ping failed", http.StatusInternalServerError)
+			c.String(http.StatusInternalServerError, "DB ping failed: %v", err)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		c.String(http.StatusOK, "OK")
 	})
 
 	serverAddr := ":" + cfg.ServerPort
-	log.Printf("INFO: Starting server on %s", serverAddr)
+	log.Printf("INFO: Starting Gin server on %s", serverAddr)
 	log.Printf("INFO: Custom GraphQL endpoint (for Hasura Remote Schema): http://localhost%s/graphql", serverAddr)
 	log.Printf("INFO: Hasura Auth Webhook endpoint: POST /auth/webhook")
 	log.Printf("INFO: Health check endpoint: GET /health")
 
-	if err := http.ListenAndServe(serverAddr, mux); err != nil {
+	if err := router.Run(serverAddr); err != nil {
 		log.Fatalf("FATAL: Server failed to start: %v", err)
 	}
 }
